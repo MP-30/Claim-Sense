@@ -1,6 +1,6 @@
 # ClaimSense
 
-ClaimSense processes synthetic motor insurance claims. It reads PDF claim forms, surveyor reports, and optional police reports, then checks policy coverage, calculates a payout, and routes claims for review. FastAPI serves the workflow, PostgreSQL 18 stores claims and LangGraph checkpoints, and Streamlit displays saved results. The course reference is credited to Shivank Agrawal.
+ClaimSense processes synthetic motor insurance claims. It reads PDF claim forms, surveyor reports, and optional police reports, then checks policy coverage, calculates a payout, and routes claims for review. FastAPI serves the workflow, PostgreSQL 18 stores claims and LangGraph checkpoints, and Streamlit displays saved results. 
 
 ## Run locally with Docker Compose
 
