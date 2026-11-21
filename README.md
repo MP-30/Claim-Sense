@@ -1,6 +1,39 @@
 # ClaimSense
 
-FastAPI application scaffold for motor insurance claims processing. The course reference is credited to Shivank Agrawal.
+ClaimSense processes synthetic motor insurance claims. It reads PDF claim forms, surveyor reports, and optional police reports, then checks policy coverage, calculates a payout, and routes claims for review. FastAPI serves the workflow, PostgreSQL 18 stores claims and LangGraph checkpoints, and Streamlit displays saved results. The course reference is credited to Shivank Agrawal.
+
+## Run locally with Docker Compose
+
+From the project root, start PostgreSQL, the API, and the Streamlit portal.
+
+```bash
+docker compose up --build --wait
+docker compose ps
+```
+
+| Browser page | What you can do |
+| --- | --- |
+| [ClaimSense portal](http://127.0.0.1:8501) | Browse saved claims, decision letters, and audit history. |
+| [Swagger UI](http://127.0.0.1:8000/docs) | Upload PDFs, run sample claims, and submit review decisions. |
+
+The portal is read-only and runs in Streamlit viewer mode, which hides the default Deploy button. **No claims yet** means the API returned an empty claim list. If you previously started only the database and API, bring up the portal with `docker compose up --build -d ui`.
+
+Check the API and database version from the terminal.
+
+```bash
+curl --fail http://127.0.0.1:8000/health
+docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHOW server_version;"'
+```
+
+FastAPI initializes the claim and checkpoint tables on startup. PostgreSQL data persists in the `postgres-data` volume. The API mounts the repository's `data/` directory for policy wording, uploads, and sample documents.
+
+## Submit and review a claim
+
+For a model-backed run, set `OPENAI_API_KEY`, add the policy clauses to `data/policy_wording.md`, and seed PostgreSQL with the matching reference data. To run a sample claim through `POST /claims/sample/{claim_id}`, place its PDFs in `data/sample_claims/{claim_id}/`. The sample generator is still a placeholder.
+
+1. Use `POST /claims` in Swagger UI to upload a claim form, a surveyor report, and an optional police report as PDFs. The current endpoint processes the claim during the request.
+2. Use `GET /claims/{claim_id}` to inspect the returned claim, including its recommendation and audit history.
+3. For a pending claim, use `POST /claims/{claim_id}/review` to submit the decision. The current API accepts the reviewer's name in the request body. Refresh the portal to see the updated status and decision letter.
 
 ## Project layout
 
@@ -27,27 +60,9 @@ Claim-Sense/
 └── pyproject.toml
 ```
 
-## Run PostgreSQL and the API
+## Run the API with hot reload
 
-From the project root, start PostgreSQL 18 and FastAPI together.
-
-```bash
-docker compose up --build --wait db api
-curl --fail http://127.0.0.1:8000/health
-docker compose exec db psql -U claimsense -d claimsense -c 'SHOW server_version;'
-```
-
-Open [Swagger UI](http://127.0.0.1:8000/docs) to try the endpoints. Both the claims tables and LangGraph checkpoint tables are initialized during API startup. PostgreSQL data persists in the `postgres-data` volume. Policy wording, uploads, and sample documents live in the repository's `data/` directory, mounted into the API container.
-
-To view stored claims in the browser, start the Streamlit service.
-
-```bash
-docker compose up --build -d ui
-```
-
-Open the [ClaimSense portal](http://127.0.0.1:8501) to view claims, decision letters, and audit history. Use Swagger UI to submit claims.
-
-To run the API in your local Python environment with reload, start just the database.
+To run the API in your local Python environment with reload, stop the Compose API if it is using port 8000, then start just the database.
 
 ```bash
 docker compose up -d --wait db
@@ -55,9 +70,7 @@ uv sync --locked
 uv run fastapi dev
 ```
 
-See `.env.example` for the local defaults. Set `POSTGRES_PORT` if port 5432 is in use. The local API connects through the published port, while the API container uses `db:5432`. A host-run API can also connect to another PostgreSQL instance through `DATABASE_URL`. The database image applies username, password, and database initialization settings on a fresh volume.
-
-To run a sample claim, add the policy clauses to `data/policy_wording.md`, set `OPENAI_API_KEY`, and populate the sample PDFs and their PostgreSQL reference data. The sample generator is still a placeholder. With an empty database, `GET /claims` returns an empty list.
+See `.env.example` for local defaults. Set `POSTGRES_PORT` if port 5432 is in use. The host-run API uses the published port, and the API container uses `db:5432`. A host-run API can connect to another PostgreSQL instance through `DATABASE_URL`. The database image applies the configured username, password, and database name when it initializes a fresh volume.
 
 ## Map the course files
 
