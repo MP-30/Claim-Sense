@@ -1,18 +1,61 @@
 services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-claimsense}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-claimsense_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-claimsense}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
   api:
     build: .
-    env_file: .env
-    ports: ["8000:8000"]
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-claimsense}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-claimsense_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-claimsense}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      USD_TO_INR: ${USD_TO_INR:-88}
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
-      - claims-data:/app/data
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=3).close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
 
   ui:
     build: .
-    command: ["streamlit", "run", "ui/portal.py", "--server.port", "8501", "--server.address", "0.0.0.0", "--server.headless", "true"]
+    command:
+      - streamlit
+      - run
+      - ui/portal.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --client.toolbarMode=viewer
     environment:
       API_URL: http://api:8000
-    ports: ["8501:8501"]
-    depends_on: [api]
+    ports: ["127.0.0.1:8501:8501"]
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
-  claims-data:
+  postgres-data:
