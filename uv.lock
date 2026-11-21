@@ -178,7 +178,7 @@ wheels = [
 [[package]]
 name = "claim-sense"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "fastapi", extra = ["standard"] },
     { name = "langgraph" },

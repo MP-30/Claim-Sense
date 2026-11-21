@@ -1,8 +1,5 @@
+"""Compatibility entry point for running the application from the repo root."""
 
-from fastapi import  FastAPI
+from claim_sense.main import app
 
-app = FastAPI()
-
-@app.get("/")
-def test():
-    return "Running fine"
+__all__ = ["app"]

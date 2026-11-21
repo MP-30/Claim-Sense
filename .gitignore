@@ -1,3 +1,12 @@
 .venv
 .idea/
 __pycache__/
+.env
+.env.*
+!.env.example
+data/*.db*
+data/policy_index.json
+data/uploads/
+data/sample_claims/
+data/eval_labels.csv
+evals/results_*.csv
