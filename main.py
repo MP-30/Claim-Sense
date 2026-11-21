@@ -1,6 +1,8 @@
-def main():
-    print("Hello from claim-sense!")
 
+from fastapi import  FastAPI
 
-if __name__ == "__main__":
-    main()
+app = FastAPI()
+
+@app.get("/")
+def test():
+    return "Running fine"
