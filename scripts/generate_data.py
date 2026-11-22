@@ -1,7 +1,7 @@
 """
 ClaimSense — Agentic Motor Insurance Claims Processor
-Purpose: Creates everything the project needs to run, with NO API key:
-           1. data/claims.db           -> policies, prior claims, garages (the insurer's core system)
+Seed the demo dataset without a model key:
+           1. PostgreSQL               -> policies, prior claims, garages (the insurer's core system)
            2. data/sample_claims/...   -> 20 claims, each with PDF documents (claim form, survey, FIR)
            3. data/eval_labels.csv     -> the "correct answer" for every sample claim (for evals)
 
@@ -18,8 +18,9 @@ All names, companies, garages and documents are fictional.
 """
 
 import csv
-import shutil
 from datetime import date
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -27,9 +28,12 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+from sqlalchemy import select, text
+
 from claim_sense.core import config
 from claim_sense.db import session as db
 from claim_sense.domain import rules
+from claim_sense.models.models import Base, Garage, Policy, PriorClaim
 
 # ---------------------------------------------------------------------------
 # Reference data
@@ -486,7 +490,7 @@ def kv_table(rows):
 
 
 def write_pdf(path, title, subtitle, blocks):
-    doc = SimpleDocTemplate(str(path), pagesize=A4, topMargin=15 * mm, bottomMargin=15 * mm)
+    doc = SimpleDocTemplate(str(path), pagesize=A4, invariant=1, topMargin=15 * mm, bottomMargin=15 * mm)
     story = [Paragraph("SAMPLE DOCUMENT - FICTIONAL - FOR TEACHING ONLY", STYLES["Italic"]),
              Paragraph(title, STYLES["Title"]), Paragraph(subtitle, STYLES["Normal"]), Spacer(1, 6 * mm)]
     for block in blocks:
@@ -563,28 +567,31 @@ def make_fir(s, folder):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
-    config.DATA_DIR.mkdir(exist_ok=True)
-    # Start fresh every time so the data always matches the scenarios above
-    for path in (config.DB_PATH, config.CHECKPOINT_DB_PATH):
-        path.unlink(missing_ok=True)
-    shutil.rmtree(config.SAMPLE_CLAIMS_DIR, ignore_errors=True)
-    config.SAMPLE_CLAIMS_DIR.mkdir(parents=True)
-    db.init_db()
+def seed_reference_data(session):
+    for garage_id, name, city, watchlist in GARAGES:
+        session.merge(Garage(garage_id=garage_id, name=name, city=city, watchlist=bool(watchlist)))
 
-    with db.connect() as conn:
-        conn.executemany("INSERT INTO garages VALUES (?, ?, ?, ?)", GARAGES)
-        for p in [s["policy"] for s in SCENARIOS] + FILLER_POLICIES:
-            conn.execute(f"INSERT INTO policies ({', '.join(p)}) VALUES ({', '.join('?' * len(p))})", tuple(p.values()))
-        for s in SCENARIOS:
-            for claim_date, amount in s["prior_claims"]:
-                conn.execute("INSERT INTO prior_claims (policy_number, claim_date, amount) VALUES (?, ?, ?)",
-                             (s["policy"]["policy_number"], claim_date, amount))
+    for policy_data in [s["policy"] for s in SCENARIOS] + FILLER_POLICIES:
+        fields = policy_data.copy()
+        for field in ("registration_date", "start_date", "end_date"):
+            fields[field] = date.fromisoformat(fields[field])
+        fields["zero_dep"] = bool(fields["zero_dep"])
+        session.merge(Policy(**fields))
 
+    for scenario in SCENARIOS:
+        for claim_date, amount in scenario["prior_claims"]:
+            fields = dict(policy_number=scenario["policy"]["policy_number"],
+                          claim_date=date.fromisoformat(claim_date), amount=amount)
+            # Earlier seeds may already contain the same history with a database-generated ID.
+            if session.scalar(select(PriorClaim.id).filter_by(**fields).limit(1)) is None:
+                session.add(PriorClaim(**fields))
+
+
+def write_demo_files(directory: Path) -> None:
     label_rows = []
     for s in SCENARIOS:
-        folder = config.SAMPLE_CLAIMS_DIR / s["claim_id"]
-        folder.mkdir()
+        folder = directory / "sample_claims" / s["claim_id"]
+        folder.mkdir(parents=True)
         make_claim_form(s, folder)
         make_survey_report(s, folder)
         if s["fir"]:
@@ -603,16 +610,34 @@ def main():
         print(f"  {s['claim_id']}  {len(list(folder.glob('*.pdf')))} PDFs  -> expected {route:<18} "
               f"{recommendation:<8} payable={expected_payable or '-'}")
 
-    with open(config.EVAL_LABELS_PATH, "w", newline="") as fh:
+    with (directory / "eval_labels.csv").open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=["claim_id", "expected_route", "expected_recommendation",
                                                 "is_fraud", "expected_payable"])
         writer.writeheader()
         writer.writerows(label_rows)
 
-    print(f"\nCreated {config.DB_PATH.name}: {len(SCENARIOS) + len(FILLER_POLICIES)} policies, "
+
+def main() -> None:
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=config.DATA_DIR) as staging:
+        directory = Path(staging)
+        write_demo_files(directory)
+        with db.SessionLocal.begin() as session:
+            # Serialize seeders even when both start against an empty database.
+            session.execute(text("SELECT pg_advisory_xact_lock(hashtext('claim_sense.demo_seed'))"))
+            Base.metadata.create_all(session.connection())
+            seed_reference_data(session)
+            session.flush()
+            for source in directory.rglob("*"):
+                if source.is_file():
+                    target = config.DATA_DIR / source.relative_to(directory)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    source.replace(target)
+
+    print(f"\nSeeded PostgreSQL reference data: {len(SCENARIOS) + len(FILLER_POLICIES)} policies, "
           f"{len(GARAGES)} garages, {sum(len(s['prior_claims']) for s in SCENARIOS)} prior claims")
-    print(f"Created {len(SCENARIOS)} sample claims in {config.SAMPLE_CLAIMS_DIR.relative_to(config.ROOT_DIR)}")
-    print(f"Created eval labels in {config.EVAL_LABELS_PATH.relative_to(config.ROOT_DIR)}")
+    print(f"Created {len(SCENARIOS)} sample claims in {config.SAMPLE_CLAIMS_DIR}")
+    print(f"Created eval labels in {config.EVAL_LABELS_PATH}")
 
 
 if __name__ == "__main__":

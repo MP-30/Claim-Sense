@@ -27,13 +27,34 @@ docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHO
 
 FastAPI initializes the claim and checkpoint tables on startup. PostgreSQL data persists in the `postgres-data` volume. The API mounts the repository's `data/` directory for policy wording, uploads, and sample documents.
 
-## Submit and review a claim
+## Seed the demo dataset
 
-For a model-backed run, set `OPENAI_API_KEY`, add the policy clauses to `data/policy_wording.md`, and seed PostgreSQL with the matching reference data. To make a sample available in the portal, place its PDFs in `data/sample_claims/{claim_id}/`. The course generator's database setup still uses SQLite.
+From the project root, start PostgreSQL and run the generator on the host. It uses the database settings in `.env`. The default settings connect to the published Compose database port.
+
+```bash
+docker compose up -d --wait db
+uv run --locked python -m scripts.generate_data
+```
+
+The generator seeds 25 policies, 13 garages and five prior claims. It writes the PDFs for 20 scenarios under `data/sample_claims/` and their expected outcomes to `data/eval_labels.csv`. Reruns refresh the supplied fixtures and preserve submitted claims, reviews, uploads and audit history. Data setup works without an OpenAI key.
+
+For model-backed processing, also copy `claimsense/data/policy_wording.md` from Shivank Agrawal’s course package into the project’s `data/` directory and set `OPENAI_API_KEY` for the API. In the local course installation the source is `~/Documents/scaler_notes/ai-bootcamp/day6/insurance-project3/claimsense/data/policy_wording.md`.
+
+## Submit and review a claim
 
 1. Open **Submit claim**. Upload the claim form, surveyor report, and optional police FIR as PDFs, or choose **Run a sample**. The API processes the claim during the request.
 2. Inspect the recommendation, assessed payout, routing reasons, and audit trail. Use the **Adjuster review** or **SIU investigation** queue to find claims awaiting a decision.
 3. Open a pending claim, enter the reviewer name, and submit an approval or rejection. Add notes when overriding the AI recommendation. The portal displays the final payout and decision letter after the API saves the decision.
+
+## Run the claim review integration test
+
+With Docker running, run this from the project root.
+
+```bash
+uv run --locked python -m unittest discover -s tests -v
+```
+
+The test seeds a disposable PostgreSQL 18 database, uploads the generated `CLM-1014` PDFs and runs the FastAPI and LangGraph workflow with fake OpenAI responses. It repeats the seed after human review and checks dataset counts, claim details, uploaded PDFs and audit history. It verifies the adjuster queue status, the rejection under `EXC-4`, the ₹0 final payout, the decision letter, and both audit events. The test uses temporary files and removes its database container on exit.
 
 ## Project layout
 
@@ -90,6 +111,6 @@ Destinations below are inside `src/claim_sense/`.
 | `app/graph.py` | `workflows/graph.py` |
 | `app/api.py` | `api/claims.py` for route functions |
 
-Use `claim_sense.*` imports when moving the remaining course code. When adapting the course data generator, use `SessionLocal` and the SQLAlchemy models to seed PostgreSQL. The course generator writes reference data to its SQLite database.
+Use `claim_sense.*` imports when moving the remaining course code.
 
 Terraform lives in the sibling `Claim-Sense-Terraform` repository.

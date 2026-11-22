@@ -1,218 +1,68 @@
-# ClaimSense System Design
+# ClaimSense system design
 
-ClaimSense processes synthetic motor insurance claims from a claim form, a surveyor report, and an optional police report. It checks policy coverage, calculates a payable amount, and routes claims to automatic approval, an adjuster, or the Special Investigation Unit (SIU). The design builds on Shivank Agrawal's ClaimSense course.
+ClaimSense processes synthetic motor insurance claims for the fictional insurer NorthStar. For each submission, it checks coverage, calculates the amount supported by the survey and determines who may make the final decision. A small, covered claim can settle automatically. Every recommended rejection needs a person’s decision. [Course problem by Shivank Agrawal](../../Documents/scaler_notes/ai-bootcamp/day6/insurance-project3/problem.html)
 
-The local baseline runs on FastAPI, PostgreSQL 18, LangGraph, and Streamlit. A smoke test with mocked model responses verified that a pending claim could survive container replacement and resume from PostgreSQL. The roadmap's next milestone is a repeatable `CLM-1014` upload and review test.
-
-## Current runtime
+## Follow one claim through the current system
 
 ```mermaid
 flowchart LR
-    Browser["Local browser"]
-    Model["OpenAI models"]
-
-    subgraph Local["Docker Compose"]
-        Portal["Streamlit portal · 8501"]
-        API["FastAPI and Swagger UI · 8000"]
-        Graph["LangGraph workflow inside the API process"]
-        Database[("PostgreSQL 18 · claim records, audit events, checkpoints")]
-        Files[("Mounted data directory · PDFs, policy clauses, embedding cache")]
-
-        Portal -->|"Read claims and audit history"| API
-        API -->|"Run or resume during the request"| Graph
-        API -->|"Read claim records"| Database
-        API -->|"Save uploaded PDFs"| Files
-        Graph -->|"Read references and persist progress"| Database
-        Graph -->|"Read PDFs and policy clauses"| Files
-    end
-
-    Browser -->|"Browse saved results"| Portal
-    Browser -->|"Upload or submit a review"| API
-    Graph -->|"Extraction, embeddings, judgments, letter"| Model
+    Browser[Browser] --> Portal[Streamlit portal]
+    Portal -->|Submit, review, fetch| API[FastAPI]
+    Browser -->|Swagger UI| API
+    API -->|Save uploaded PDFs| Files[(Mounted data directory)]
+    API -->|Run or resume during HTTP request| Graph[LangGraph in API process]
+    Graph -->|Read PDFs and policy wording| Files
+    Graph -->|Extract, embed, judge, draft| Model[OpenAI]
+    Graph -->|Read reference data, save claim and checkpoints| DB[(PostgreSQL 18)]
+    API -->|Read claims and audit events| DB
 ```
 
-The portal is read-only. The API persists claim snapshots for browser reads. LangGraph persists execution state under the stored `thread_id` so a later review request can resume the same run. Sample reprocessing currently replaces the prior claim and its audit history. [Local setup](README.md) · [API routes](src/claim_sense/api/claims.py) · [Claim service](src/claim_sense/services/service.py)
+1. **Submit.** Streamlit posts the claim form, survey report and optional police FIR to `POST /claims`. The API saves the PDFs under `data/uploads/<claim_id>/`, creates a `PROCESSING` claim and assigns a fresh LangGraph `thread_id`. The sample endpoint uses an existing directory and its sample ID. [API routes](src/claim_sense/api/claims.py) · [Claim service](src/claim_sense/services/service.py)
+2. **Read and assess.** Each PDF gets a separate model call and typed output. Python checks policy existence, vehicle registration, cover dates, own-damage cover and licence validity. A hard failure skips coverage retrieval and payout assessment and goes directly to the fraud check. Otherwise the graph retrieves policy clauses, asks the model about exclusions, then calculates the amount from the survey items. [Intake](src/claim_sense/services/intake.py) · [Graph edges](src/claim_sense/workflows/graph.py)
+3. **Route.** The model compares the accounts in the form, survey and FIR. Python combines contradictions with signals such as prior claims and garage watchlist status, records their points and chooses the route. The API returns HTTP 200 with the saved claim once it finishes or pauses. Initial graph exceptions are also recorded as a claim with `status=FAILED` and an `error` field. Inspect the returned status when debugging an upload. [Rules](src/claim_sense/domain/rules.py) · [Claim service](src/claim_sense/services/service.py)
+4. **Review and finalize.** For a pending claim, the portal posts the review to `/claims/{claim_id}/review`. The service checks pending status, the approval amount against the available insured declared value (IDV), and notes for overrides. It resumes the saved thread. Python sets the final amount, using zero for rejection, and the model drafts the letter. The portal displays the saved letter and audit trail. Sending the letter to a customer would require a delivery integration. Reviewer names currently come from the submitted form. [Portal](ui/portal.py) · [Review schema](src/claim_sense/schemas/schemas.py)
 
-## Claim workflow
+For example, uploading the PDFs from `CLM-1014` creates a new `CLM-U…` ID. The integration test supplies a police finding of intoxication, retrieves `EXC-4`, and checks that the recommendation is `REJECT` while the status is still `PENDING_ADJUSTER`. After the adjuster rejects, the same claim reads `REJECTED` with a ₹0 final amount. Use the ID from the upload response for both the review and the final GET. [Executable example](tests/test_claim_review.py)
 
-```mermaid
-flowchart TD
-    Start["Start claim run"] --> Intake["Extract typed fields from PDFs"]
-    Intake --> Policy{"Hard policy check found an issue?"}
-    Policy -->|"No"| Coverage["Retrieve policy clauses and judge coverage"]
-    Coverage --> Amount["Calculate depreciation, deductible, and payable amount"]
-    Amount --> Fraud["Check document consistency and score fraud signals"]
-    Policy -->|"Yes"| Fraud
-    Fraud --> Route{"Choose route"}
-    Route -->|"AUTO_APPROVE"| Finalize["Write letter and persist final decision"]
-    Route -->|"ADJUSTER_REVIEW"| Adjuster["PENDING_ADJUSTER"]
-    Route -->|"SIU_INVESTIGATION"| SIU["PENDING_SIU"]
-    Adjuster --> Pause["Pause at the human-review checkpoint"]
-    SIU --> Pause
-    Pause -->|"Review submitted for the same thread"| Finalize
-    Finalize --> Result["APPROVED or REJECTED"]
-```
+## How the decision is calculated
 
-Python controls eligibility checks, payout arithmetic, fraud scoring, and routing thresholds. Policy retrieval ranks embedded clauses by similarity. The model extracts fields, judges coverage using those clauses, flags document inconsistencies, and drafts a letter from the selected decision and amount. With the current defaults, a fraud score of 50 or more routes to SIU. Otherwise, a rejection recommendation, score of 25 or more, total loss, payable amount above ₹50,000, or lower-confidence coverage routes to an adjuster. A human makes the final decision on any recommended rejection. [Workflow](src/claim_sense/workflows/graph.py) · [Policy retrieval](src/claim_sense/services/policy_rag.py) · [Business rules](src/claim_sense/domain/rules.py)
+**Coverage.** The retriever splits the policy wording on clause headings, embeds the clauses, and ranks them by cosine similarity to the claim facts. Up to six clauses go to the model. The service removes any cited exclusion ID outside that set and lowers confidence on unsupported citations or an exclusion with no valid citation. This checks clause membership. A reviewer still needs to judge whether the facts support the exclusion. [Retrieval](src/claim_sense/services/policy_rag.py) · [Coverage judgment](src/claim_sense/services/judgments.py)
 
-## Planned worker and review flow
+**Payout.** Python starts with the surveyor’s assessed line items. Each line retains the part category, amount, depreciation rate, deduction and net amount. Zero-depreciation cover waives part depreciation. The ordinary payout subtracts depreciation and the compulsory deductible, with a floor of zero and a cap at IDV. Gross repairs above 75% of IDV use the total-loss calculation of IDV less deductible. For the clean fixture `CLM-1001`, ₹20,700 − ₹7,650 − ₹1,000 gives ₹12,050. [Payout rules](src/claim_sense/domain/rules.py) · [Course worked example](../../Documents/scaler_notes/ai-bootcamp/day6/insurance-project3/solution.html)
 
-The API will acknowledge uploads after committing a claim and a processing job. A separate worker will run the graph and use the existing PostgreSQL checkpoints. PostgreSQL also holds the accepted review and the job that resumes it.
+**Routing.** Apply these rows top to bottom. A recommendation describes coverage. A route selects the decision maker, so a claim with an approval recommendation can still require investigation. [Thresholds](src/claim_sense/core/config.py) · [Routing order](src/claim_sense/domain/rules.py)
 
-```mermaid
-sequenceDiagram
-    actor Client as Claim submitter
-    actor Reviewer
-    participant API as FastAPI
-    participant Files as PDF storage
-    participant DB as PostgreSQL
-    participant Worker as Claim worker
+| First matching condition | Route | Result |
+| --- | --- | --- |
+| Fraud score ≥ 50 | SIU_INVESTIGATION | Pause at PENDING_SIU |
+| Recommended rejection, score ≥ 25, total loss, payable > ₹50,000, or coverage confidence below high | ADJUSTER_REVIEW | Pause at PENDING_ADJUSTER |
+| Remaining eligible claims | AUTO_APPROVE | Generate letter and set APPROVED |
 
-    Client->>API: POST /claims with PDFs and idempotency key
-    API->>Files: Store immutable PDFs
-    API->>DB: Commit claim, run, and processing job
-    API-->>Client: 202 Accepted with claim ID
-    Worker->>DB: Claim job and commit lease
-    Worker->>Files: Read PDFs for the run
-    Worker->>DB: Run graph and persist checkpoints
-    alt Human review required
-        Worker->>DB: Publish pending status after checkpoint is saved
-        Reviewer->>API: Submit review decision
-        API->>API: Authenticate reviewer and check assigned queue
-        API->>DB: Commit accepted review and resume job together
-        API-->>Reviewer: 202 Accepted
-        Worker->>DB: Claim resume job and read saved decision and checkpoint
-        Worker->>Worker: Resume the same LangGraph thread
-    else Eligible for automatic approval
-        Worker->>Worker: Use rule-based approval and calculated payout
-    end
-    Worker->>DB: Commit final result, letter, audit event, and job completion
-    Client->>API: GET /claims/{claim_id}
-    API->>DB: Read committed result
-    API-->>Client: Claim status, decision, and audit history
-```
+## What survives a restart
 
-### Uploads, leases, and recovery
-
-- **Upload idempotency.** Scope an idempotency key to the submitter and associate it with a hash of the PDF contents by document type. Reusing the key with the same contents returns the original claim ID. Different contents return `409 Conflict`. Keep staged PDFs at distinct storage keys and clean up unreferenced uploads after failed or duplicate submissions.
-- **Job leasing.** Select an eligible job using `FOR UPDATE SKIP LOCKED`. Commit a lease token, expiry, and attempt record before starting work. Renew the lease during longer operations, let replacement workers reclaim expired leases, and use bounded backoff for transient failures.
-- **Safe recovery.** Extend checkpoint persistence to verify the lease token and expiry in the same transaction as each checkpoint write. Apply the same check to business writes. A replacement worker resumes from the last committed checkpoint with the same `thread_id`. If a crash occurs between saving the review interrupt and publishing the pending status, the replacement can publish the already-saved pending state.
-- **Finalization.** Use one final decision row per run. Commit the outcome, saved letter, final audit event, and job completion together. Retries can repeat external model calls. The database constraint and lease check keep the committed result unique.
-- **Review authorization.** Derive reviewer identity from authentication and enforce access to the assigned queue. Store one accepted decision per run with actor, timestamp, amount, and notes. Require notes for overrides. Return the saved result for an identical replay and reject conflicting decisions.
-
-### Planned status transitions
-
-```mermaid
-stateDiagram-v2
-    [*] --> QUEUED
-    QUEUED --> PROCESSING: Worker leases initial job
-    PROCESSING --> PENDING_ADJUSTER: Adjuster checkpoint saved
-    PROCESSING --> PENDING_SIU: SIU checkpoint saved
-    PROCESSING --> FINALIZING: Auto-approval route
-    PENDING_ADJUSTER --> REVIEW_QUEUED: Authorized decision committed
-    PENDING_SIU --> REVIEW_QUEUED: Authorized decision committed
-    REVIEW_QUEUED --> FINALIZING: Worker resumes saved thread
-    FINALIZING --> APPROVED: Approval and letter committed
-    FINALIZING --> REJECTED: Rejection and letter committed
-    PROCESSING --> FAILED: Permanent error or retries exhausted
-    REVIEW_QUEUED --> FAILED: Resume retries exhausted
-    FINALIZING --> FAILED: Permanent error or retries exhausted
-    APPROVED --> [*]
-    REJECTED --> [*]
-    FAILED --> [*]
-```
-
-Keep retry scheduling in the job record. The claim stays in its current phase while an attempt can still recover.
-
-## Planned persistence model
-
-The baseline already has `claims`, `audit_log`, `policies`, `prior_claims`, and `garages`, plus the tables managed by LangGraph's PostgreSQL checkpointer. The target claim-processing records below are the basis for versioned migrations. The reference tables continue to supply policy, history, and garage data. [Current SQLAlchemy models](src/claim_sense/models/models.py)
-
-```mermaid
-erDiagram
-    CLAIMS ||--o{ CLAIM_DOCUMENTS : contains
-    CLAIMS ||--o{ CLAIM_RUNS : has
-    CLAIM_RUNS ||--o{ PROCESSING_JOBS : schedules
-    PROCESSING_JOBS ||--o{ JOB_ATTEMPTS : records
-    CLAIM_RUNS ||--o| REVIEW_DECISIONS : accepts
-    CLAIM_RUNS ||--o| FINAL_DECISIONS : produces
-    CLAIM_RUNS ||--o{ AUDIT_LOG : records
-
-    CLAIMS {
-        string claim_id PK
-        string policy_number
-        string status
-        string submission_scope
-        string idempotency_key
-        string input_hash
-    }
-    CLAIM_DOCUMENTS {
-        string document_id PK
-        string claim_id FK
-        string document_type
-        string storage_key
-    }
-    CLAIM_RUNS {
-        string run_id PK
-        string claim_id FK
-        string thread_id UK
-    }
-    PROCESSING_JOBS {
-        string job_id PK
-        string run_id FK
-        string kind
-        string status
-        string lease_token
-        datetime lease_expires_at
-        datetime available_at
-    }
-    JOB_ATTEMPTS {
-        string attempt_id PK
-        string job_id FK
-        datetime started_at
-        datetime finished_at
-        string outcome
-    }
-    REVIEW_DECISIONS {
-        string run_id PK, FK
-        string reviewer_id
-        string decision
-        decimal approved_amount
-        string notes
-        datetime decided_at
-    }
-    FINAL_DECISIONS {
-        string run_id PK, FK
-        string decision
-        decimal final_amount
-        string letter
-    }
-    AUDIT_LOG {
-        bigint id PK
-        string run_id FK
-        string actor
-        string step
-        datetime ts
-    }
-```
-
-Enforce unique `(submission_scope, idempotency_key)` and `(run_id, kind)` constraints for claim submissions and jobs. Job kinds are `PROCESS` and `RESUME`. Retrying a job appends an attempt to the same job. A deliberate rerun gets a new run and thread ID while preserving previous attempts, decisions, and audit events. Application tables remain the authority for API status and decisions.
-
-## Planned evidence and deployment
-
-- **PDF evidence.** Start with payout-critical survey line items. Store each extracted value with its document ID, page number, supporting quote, and verification result. Match the quote against text on the cited page and check that it supports the value. Missing or conflicting evidence goes to manual review. The reviewer sees the PDF evidence, retrieved policy clauses, and deterministic payout breakdown.
-- **Local development.** Run the API, UI, worker, and PostgreSQL in Docker Compose. Make the PDF directory available to both the API and worker. Run integration tests with fake model responses and a disposable PostgreSQL database.
-- **AWS demo.** The sibling `Claim-Sense-Terraform` repository will define the deployment. The planned topology uses ECS tasks for API, UI, and worker, RDS for PostgreSQL, and private S3 storage for PDFs. Use runtime secrets and task roles for resource access. Log claim IDs, workflow steps, attempts, latency, and model cost without including PDF contents.
-
-## Verification scenarios
-
-| Scenario | Expected result |
+| Store | Contents and reader |
 | --- | --- |
-| `CLM-1014` baseline | With fake model responses, the claim reaches `PENDING_ADJUSTER` with a rejection recommendation. A human rejection yields `REJECTED`, zero payout, a letter, and review and finalization audit events. |
-| `CLM-1001` and `CLM-1019` | Verify the ₹12,050 payout for the clean claim and SIU routing for the investigation case. |
-| Duplicate and conflicting uploads | An identical replay returns the same claim ID. Changing the PDFs with the same key yields `409 Conflict`. |
-| Worker lost during processing | A replacement reclaims the job, resumes the run, and leaves prior attempts visible. |
-| Worker stops after a review is accepted | The review and resume job survive together. The replacement produces one final decision, letter, and finalization audit event. |
-| Reviewer or citation failure | A reviewer outside the assigned queue is denied. A payout-critical value without verified evidence goes to manual review. |
+| Mounted `data/` | The API writes uploads here. The graph reads PDFs and policy wording and caches clause embeddings in `policy_index.json`. Sample directories and eval labels are local inputs. |
+| PostgreSQL application tables | `policies`, `garages` and `prior_claims` supply reference facts. `claims` holds the current status, thread ID, assessment, recommendation, final amount and letter. `audit_log` records the actor, time, step and result. Claim detail and queue endpoints read these tables. |
+| PostgreSQL LangGraph tables | Checkpoints hold the execution state for a thread. A review uses its stored ID and `Command(resume=...)`. The Compose volume keeps both application records and checkpoints across API restarts. |
 
-Use the same cases to compare payout accuracy, routing accuracy, evidence verification, model cost, and end-to-end latency. Record per-case results and document how to reproduce them before the AWS recovery demo.
+Startup creates tables. Loading reference rows is a separate operation. Rerunning a named sample clears its previous claim row and audit entries and allocates a new thread. For repeatable comparisons, use a dedicated demo database. Application writes, audit events and checkpoints currently commit separately. A persisted review pause supports later resumption, while recovery from a crash between writes still needs the worker changes below. [Persistence](src/claim_sense/db/repository.py) · [Application startup](src/claim_sense/main.py) · [Compose](docker-compose.yml)
+
+## Verification and remaining course work
+
+The checked-in workflow code and the local `CLM-1014` test cover the synchronous path. The test uses a disposable PostgreSQL database and a mocked model. The course also calls for real-document extraction across 20 samples, a restart during review, a manager dashboard, an evaluation scorecard and an AWS demo with teardown. The [roadmap](roadmap.md) gives the acceptance check for each.
+
+The evaluator measures processing through the first pause or finalization. Claim snapshots sum model usage accumulated on that path. Building the reusable policy index has a separate embedding cost, and the supplied price table assigns zero to an unlisted model. Record the model, pricing assumptions and timing boundary with the scorecard. [Evaluator](evals/run_evals.py) · [Cost calculation](src/claim_sense/integrations/llm.py)
+
+## Proposed worker and recovery
+
+Implement this extension once the synchronous baseline is reproducible. A queue shortens the upload request and gives another process a way to recover interrupted work. Keep the existing graph and public claim ID.
+
+| Boundary | Proposed behavior |
+| --- | --- |
+| Accept upload | Stage immutable PDFs by document type. In one PostgreSQL transaction, store the claim, run with a unique thread ID, and PROCESS job. Return HTTP 202 with the claim ID and status for polling. A scoped submission key plus content digest identifies identical retries. Return the original claim on a match and HTTP 409 for different content. Clean up unreferenced staged files. |
+| Execute or recover | A worker sharing the PDFs leases a job, records an attempt, renews the lease and runs the graph. After expiry a replacement resumes the same checkpoint. Fence business writes and checkpoint writes by checking current lease ownership in their respective write transactions. Bound retries and record a terminal failure reason. |
+| Publish review | Expose a pending queue status after the interrupt checkpoint is durable. If a worker stops between those writes, a replacement can publish the saved pause. Authorize the reviewer for the queue and commit one accepted review and its RESUME job together. Identical review replays return the saved result and conflicting decisions fail. |
+| Finalize | Commit one final decision per run, its letter, the final audit event and job completion together. A retry may repeat a model call. Enforce uniqueness on the committed outcome and preserve attempts and earlier runs. |
+
+Introduce these records with versioned migrations. Move uploads and sample submissions onto the worker, update the portal to poll `GET /claims/{claim_id}`, and keep the CLI and evaluator able to wait for a resolved route. For page-level evidence, start by storing a document ID, page and verified quote for one survey amount. The planned AWS deployment uses ECS, persistent PostgreSQL and private PDF storage. The sibling repository owns the infrastructure. [Terraform](../Claim-Sense-Terraform/main.tf)
