@@ -1,6 +1,6 @@
 # ClaimSense
 
-ClaimSense processes synthetic motor insurance claims. It reads PDF claim forms, surveyor reports, and optional police reports, then checks policy coverage, calculates a payout, and routes claims for review. FastAPI serves the workflow, PostgreSQL 18 stores claims and LangGraph checkpoints, and Streamlit displays saved results. 
+ClaimSense processes synthetic motor insurance claims. It reads PDF claim forms, surveyor reports, and optional police reports, then checks policy coverage, calculates a payout, and routes claims for review. FastAPI serves the workflow, PostgreSQL 18 stores claims and LangGraph checkpoints, and the Streamlit portal handles claim submission and review.
 
 ## Run locally with Docker Compose
 
@@ -13,10 +13,10 @@ docker compose ps
 
 | Browser page | What you can do |
 | --- | --- |
-| [ClaimSense portal](http://127.0.0.1:8501) | Browse saved claims, decision letters, and audit history. |
-| [Swagger UI](http://127.0.0.1:8000/docs) | Upload PDFs, run sample claims, and submit review decisions. |
+| [ClaimSense portal](http://127.0.0.1:8501) | Submit claims, work the review queues, and inspect decisions and audit history. |
+| [Swagger UI](http://127.0.0.1:8000/docs) | Explore and call the FastAPI endpoints directly. |
 
-The portal is read-only and runs in Streamlit viewer mode, which hides the default Deploy button. **No claims yet** means the API returned an empty claim list. If you previously started only the database and API, bring up the portal with `docker compose up --build -d ui`.
+The portal runs in Streamlit viewer mode, which hides the default Deploy button. If you previously started only the database and API, bring up the portal with `docker compose up --build --wait ui`.
 
 Check the API and database version from the terminal.
 
@@ -29,11 +29,11 @@ FastAPI initializes the claim and checkpoint tables on startup. PostgreSQL data 
 
 ## Submit and review a claim
 
-For a model-backed run, set `OPENAI_API_KEY`, add the policy clauses to `data/policy_wording.md`, and seed PostgreSQL with the matching reference data. To run a sample claim through `POST /claims/sample/{claim_id}`, place its PDFs in `data/sample_claims/{claim_id}/`. The sample generator is still a placeholder.
+For a model-backed run, set `OPENAI_API_KEY`, add the policy clauses to `data/policy_wording.md`, and seed PostgreSQL with the matching reference data. To make a sample available in the portal, place its PDFs in `data/sample_claims/{claim_id}/`. The course generator's database setup still uses SQLite.
 
-1. Use `POST /claims` in Swagger UI to upload a claim form, a surveyor report, and an optional police report as PDFs. The current endpoint processes the claim during the request.
-2. Use `GET /claims/{claim_id}` to inspect the returned claim, including its recommendation and audit history.
-3. For a pending claim, use `POST /claims/{claim_id}/review` to submit the decision. The current API accepts the reviewer's name in the request body. Refresh the portal to see the updated status and decision letter.
+1. Open **Submit claim**. Upload the claim form, surveyor report, and optional police FIR as PDFs, or choose **Run a sample**. The API processes the claim during the request.
+2. Inspect the recommendation, assessed payout, routing reasons, and audit trail. Use the **Adjuster review** or **SIU investigation** queue to find claims awaiting a decision.
+3. Open a pending claim, enter the reviewer name, and submit an approval or rejection. Add notes when overriding the AI recommendation. The portal displays the final payout and decision letter after the API saves the decision.
 
 ## Project layout
 
