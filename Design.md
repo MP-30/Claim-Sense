@@ -6,16 +6,57 @@ ClaimSense processes synthetic motor insurance claims for the fictional insurer 
 
 ```mermaid
 flowchart LR
-    Browser[Browser] --> Portal[Streamlit portal]
-    Portal -->|Submit, review, fetch| API[FastAPI]
-    Browser -->|Swagger UI| API
-    API -->|Save uploaded PDFs| Files[(Mounted data directory)]
-    API -->|Run or resume during HTTP request| Graph[LangGraph in API process]
-    Graph -->|Read PDFs and policy wording| Files
-    Graph -->|Extract, embed, judge, draft| Model[OpenAI]
-    Graph -->|Read reference data, save claim and checkpoints| DB[(PostgreSQL 18)]
-    API -->|Read claims and audit events| DB
+    Portal["Streamlit portal"] -->|Submit PDFs or a sample, review a claim| API["FastAPI"]
+    Swagger["Swagger UI"] -->|Same endpoints| API
+    API -->|Save uploaded PDFs| Files[("Mounted data directory")]
+    API -->|Start or resume within the request| Graph["LangGraph"]
+    Files -->|Sample or uploaded PDFs and policy wording| Graph
+    Graph -->|Extract facts, embed clauses, judge coverage and consistency, draft letter| Model["OpenAI"]
+    DB[("PostgreSQL 18")] -->|Policy, garage and prior claims| Graph
+    Graph -->|Save claim, audit events and thread checkpoints| DB
+    DB -->|Queue, claim detail and audit history| API
 ```
+
+### From submission to a recommendation
+
+```mermaid
+flowchart TD
+    Upload["Upload claim form and survey report<br/>Police FIR is optional"] -->|Save PDFs under a new claim ID| Start["Create PROCESSING claim<br/>Assign a fresh thread ID"]
+    Sample["Run a named sample"] -->|Reuse sample PDFs and replace its previous run| Start
+    Start --> Intake["Intake · Extract typed facts from each PDF"]
+    Intake --> Policy{"Policy found, vehicle matches, policy active,<br/>own damage covered and licence valid on loss date?"}
+    Policy -->|Yes| Coverage["Retrieve up to six policy clauses<br/>Check for exclusions and record citations and confidence"]
+    Coverage --> Amount["Calculate payable from survey items<br/>Apply depreciation, deductible and insured value limit"]
+    Amount --> Fraud["Compare the documents and score fraud signals<br/>Include garage watchlist and prior claims"]
+    Policy -->|No · record policy issues and skip payout assessment| Fraud
+    Fraud --> Recommend{"Policy issue or coverage exclusion?"}
+    Recommend -->|Yes| Reject["Recommend REJECT"]
+    Recommend -->|No| Approve["Recommend APPROVE"]
+    Reject --> Route["Choose who decides the claim"]
+    Approve --> Route
+```
+
+### From recommendation to final decision
+
+```mermaid
+flowchart TD
+    Risk{"Fraud score ≥ 50?"}
+    Risk -->|Yes| SIU["PENDING_SIU<br/>Special Investigations Unit"]
+    Risk -->|No| Review{"Any adjuster review condition?<br/>REJECT recommended, fraud score ≥ 25,<br/>total loss, payable > ₹50,000,<br/>or coverage confidence below high"}
+    Review -->|Yes| Adjuster["PENDING_ADJUSTER<br/>Adjuster review queue"]
+    Review -->|No| Auto["AUTO_APPROVE<br/>Use the calculated payable amount"]
+    SIU --> Pause["Pause at human review<br/>Keep the thread checkpoint in PostgreSQL"]
+    Adjuster --> Pause
+    Pause --> Submit["Reviewer submits a decision in the portal<br/>Include notes when overriding the recommendation"]
+    Submit --> Resume["API validates the review and resumes the saved thread"]
+    Resume -->|Approve| Accept["Use the reviewer’s approved amount"]
+    Resume -->|Reject| Decline["Set final amount to ₹0"]
+    Auto --> Final["Generate the decision letter<br/>Save APPROVED or REJECTED, amount and final audit event"]
+    Accept --> Final
+    Decline --> Final
+```
+
+**Trace it in the portal.** For sample `CLM-1008`, the recorded run had a fraud score of 0 and an assessed payout of ₹90,000. Follow **No** at the fraud threshold, then **Yes** at the adjuster check because ₹90,000 exceeds ₹50,000. The portal shows `PENDING_ADJUSTER` until a reviewer submits a decision. The restart test approves this claim on its saved thread and checks the ₹90,000 letter. [Recorded run](evals/scorecards/2026-11-23.csv) · [Portal test](tests/test_portal_restart.py)
 
 1. **Submit.** Streamlit posts the claim form, survey report and optional police FIR to `POST /claims`. The API saves the PDFs under `data/uploads/<claim_id>/`, creates a `PROCESSING` claim and assigns a fresh LangGraph `thread_id`. The sample endpoint uses an existing directory and its sample ID. [API routes](src/claim_sense/api/claims.py) · [Claim service](src/claim_sense/services/service.py)
 2. **Read and assess.** Each PDF gets a separate model call and typed output. Python checks policy existence, vehicle registration, cover dates, own-damage cover and licence validity. A hard failure skips coverage retrieval and payout assessment and goes directly to the fraud check. Otherwise the graph retrieves policy clauses, asks the model about exclusions, then calculates the amount from the survey items. [Intake](src/claim_sense/services/intake.py) · [Graph edges](src/claim_sense/workflows/graph.py)
