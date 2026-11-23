@@ -3,7 +3,7 @@ import json
 from claim_sense.integrations import llm
 from claim_sense.services import policy_rag
 
-from claim_sense.schemas.schemas import ConsistencyReport, CoverageDecision
+from claim_sense.schemas.schemas import ConsistencyReport, CoverageDecision, SurveyCauseFinding
 
 
 
@@ -15,7 +15,15 @@ Decide whether the loss described in the FACTS is covered by the POLICY CLAUSES 
 Rules:
 - Use ONLY the clauses provided. Cite clause IDs exactly as written, e.g. EXC-4.
 - covered=false only if a specific exclusion or limitation clearly applies to the facts.
-  List those clause IDs in exclusion_clause_ids. If covered=true, leave the list empty.
+  Identify the fact that triggers each cited clause for this loss or for the vehicle's use.
+  Evaluate the damage in the assessed repair items. Old damage mentioned elsewhere in the survey
+  is a basis for exclusion only when the exclusion applies to the loss being assessed.
+  Apply a clause in order: first establish its excluded cause using affirmative evidence, then
+  consider any exception to that exclusion. For EXC-2, identify wear, depreciation, or a
+  mechanical/electrical failure causing the assessed loss before considering the accident proviso.
+  Uncertainty about which accident caused impact damage supplies no evidence of breakdown or wear.
+  Conflicting accounts of an impact belong in the consistency check. If the documents indicate
+  accidental impact and no specific exclusion applies, return covered=true with an empty clause list.
 - Do NOT decide on late reporting, fraud suspicion, policy dates or licence expiry.
   Other checks handle those. Judge only the nature of the loss and how the car was being used.
 - confidence=high when the facts clearly point one way; medium or low when facts are ambiguous or missing.
@@ -31,6 +39,7 @@ def check_coverage(extracted: dict) -> tuple[dict, list[dict], list[dict]]:
         "how_accident_happened": form["accident_description"],
         "use_of_vehicle_at_time": form["vehicle_use_at_time"],
         "claimed_damage": form["damaged_areas"],
+        "assessed_repair_items": [item["description"] for item in survey["items"]],
         "surveyor_observations": survey["observations"],
         "police_report": None if fir is None else {
             "summary": fir["summary"], "driver_intoxicated": fir["driver_intoxicated"],
@@ -57,7 +66,35 @@ def check_coverage(extracted: dict) -> tuple[dict, list[dict], list[dict]]:
         coverage["confidence"] = "low"   # a rejection without a valid clause must go to a human
         coverage["reasoning"] += f" [Guardrail: unsupported clause citation {invented or 'missing'}]"
 
-    return coverage, clauses, [embed_usage, usage]
+    usages = [embed_usage, usage]
+    if "EXC-2" in coverage["exclusion_clause_ids"]:
+        # Verify the cause independently of the claimant's account and the first model judgment.
+        finding, cause_usage = llm.parse(
+            step="coverage:verify_cause",
+            instructions=(
+                "Read the surveyor's findings and identify what caused the assessed repairs. "
+                "Record whether the survey positively attributes any of these repairs to wear, "
+                "depreciation, or mechanical/electrical failure. Impact damage and unrelated old "
+                "scratches do not establish such a cause. Give the physical finding in one sentence."
+            ),
+            content=[llm.text_part(json.dumps({
+                "surveyor_observations": survey["observations"],
+                "assessed_repair_items": facts["assessed_repair_items"],
+            }))],
+            schema=SurveyCauseFinding,
+        )
+        usages.append(cause_usage)
+        if not finding.wear_or_breakdown:
+            remaining = [cid for cid in coverage["exclusion_clause_ids"] if cid != "EXC-2"]
+            coverage.update(
+                covered=not remaining,
+                exclusion_clause_ids=remaining,
+                confidence="low",
+                reasoning=(f"Survey finding: {finding.finding} EXC-2 is unsupported for the assessed repairs. "
+                           + (f"Other cited exclusions: {', '.join(remaining)}." if remaining
+                              else "No supported exclusion remains. Human review is required.")),
+            )
+    return coverage, clauses, usages
 
 
 

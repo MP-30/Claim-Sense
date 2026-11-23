@@ -130,7 +130,67 @@ def format_payout(amount: float | None) -> str:
     return f"₹{amount:,.2f}" if amount is not None else "—"
 
 
-def show_claim(claim_id: str) -> None:
+def show_review_evidence(details: dict) -> None:
+    coverage = details.get("coverage") or {}
+    clauses = details.get("retrieved_clauses") or []
+    issues = details.get("policy_issues") or []
+    if coverage or clauses or issues:
+        with st.expander("Policy coverage"):
+            for issue in issues:
+                st.text(f"{issue.get('clause') or issue['code']} · {issue['detail']}")
+            if coverage:
+                outcome = "Covered" if coverage["covered"] else "Excluded"
+                st.text(f"{outcome} · {coverage['confidence']} confidence")
+                st.text(coverage["reasoning"])
+                cited = coverage.get("exclusion_clause_ids") or []
+                if cited:
+                    st.text("Cited exclusions: " + ", ".join(cited))
+            for clause in clauses:
+                st.text(f"{clause['id']} · {clause['title']}")
+                if clause.get("text"):
+                    st.text(clause["text"])
+
+    assessment = details.get("assessment")
+    if assessment:
+        with st.expander("Survey and payout calculation"):
+            rows = []
+            for line in assessment["lines"]:
+                if line["category"] == "labour":
+                    rule = "OD-2"
+                elif assessment["zero_dep"]:
+                    rule = "ADD-ZD"
+                else:
+                    rule = "DEP-1"
+                rows.append({
+                    "Survey item": line["description"], "Category": line["category"].replace("_", " "),
+                    "Assessed (₹)": line["amount"], "Depreciation rate": f"{line['dep_rate']:.0%}",
+                    "Depreciation (₹)": line["depreciation"], "Net (₹)": line["net"], "Clause": rule,
+                })
+            st.dataframe(rows, hide_index=True)
+            st.text(f"Gross surveyed amount: {format_payout(assessment['gross_assessed'])}")
+            st.text(f"Total depreciation: {format_payout(assessment['total_depreciation'])}")
+            st.text(f"Compulsory deductible (DED-1): {format_payout(assessment['deductible'])}")
+            if assessment["total_loss"]:
+                st.text(f"Total loss settlement (OD-3): IDV {format_payout(assessment['idv'])} less deductible")
+            else:
+                st.text(f"Own-damage settlement limit (OD-2): IDV {format_payout(assessment['idv'])}")
+            st.text(f"Assessed payout: {format_payout(assessment['payable'])}")
+
+    fraud = details.get("fraud")
+    if fraud:
+        with st.expander("Fraud signals"):
+            signals = fraud.get("signals", [])
+            if signals:
+                st.dataframe([{"Signal": s["code"], "Points": s["points"], "Evidence": s["detail"]}
+                              for s in signals], hide_index=True)
+            else:
+                st.text("No fraud signals recorded.")
+    if details.get("extracted"):
+        with st.expander("Extracted documents"):
+            st.json(details["extracted"], expanded=False)
+
+
+def show_claim(claim_id: str, *, allow_review: bool = True) -> None:
     claim = api_request("GET", f"/claims/{quote(claim_id, safe='')}")
     if claim is None:
         return
@@ -155,7 +215,8 @@ def show_claim(claim_id: str) -> None:
         for reason in reasons:
             st.write(reason)
 
-    if claim["status"] in REVIEW_QUEUES:
+    show_review_evidence(claim["details"])
+    if allow_review and claim["status"] in REVIEW_QUEUES:
         review_claim(claim)
     if claim.get("letter"):
         st.subheader("Decision letter")
@@ -164,13 +225,22 @@ def show_claim(claim_id: str) -> None:
         st.json(claim["audit_trail"], expanded=False)
 
 
-def show_queue() -> None:
-    queue = st.selectbox("Queue", tuple(QUEUES), key="queue")
+def show_queue(manager: bool = False) -> None:
+    queue = "All claims" if manager else st.selectbox("Queue", tuple(QUEUES), key="queue")
     st.button("Refresh claims")
     status = QUEUES[queue]
     claims = api_request("GET", "/claims", params={"status": status} if status else None)
     if claims is None:
         return
+
+    if manager:
+        total, adjuster, siu, automatic = st.columns(4)
+        total.metric("Total claims", len(claims))
+        adjuster.metric("Pending adjuster", sum(c["status"] == "PENDING_ADJUSTER" for c in claims))
+        siu.metric("Pending SIU", sum(c["status"] == "PENDING_SIU" for c in claims))
+        approved = sum(c["route"] == "AUTO_APPROVE" and c["status"] == "APPROVED" for c in claims)
+        share = f"{approved / len(claims):.1%}" if claims else "—"
+        automatic.metric("Auto-approved share", share, help="Automatically approved claims divided by all claims.")
 
     if not claims:
         st.info("No claims in this queue." if status else "No claims yet. Open Submit claim to get started.")
@@ -195,7 +265,7 @@ def show_queue() -> None:
         st.session_state.pop("selected_claim", None)
     claim_id = st.selectbox("Open a claim", claim_ids, index=None, key="selected_claim")
     if claim_id is not None:
-        show_claim(claim_id)
+        show_claim(claim_id, allow_review=not manager)
 
 
 def main() -> None:
@@ -213,9 +283,9 @@ def main() -> None:
         else:
             st.success(message)
 
-    workspace = st.radio("Workspace", ("Claims", "Submit claim"), horizontal=True, key="workspace")
-    if workspace == "Claims":
-        show_queue()
+    workspace = st.radio("Workspace", ("Claims", "Submit claim", "Manager dashboard"), horizontal=True, key="workspace")
+    if workspace != "Submit claim":
+        show_queue(manager=workspace == "Manager dashboard")
         return
 
     source = st.radio("Claim source", ("Upload PDFs", "Run a sample"), horizontal=True)

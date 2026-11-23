@@ -44,8 +44,7 @@ def snapshot(state: dict) -> dict:
         "policy": state.get("policy"),
         "policy_issues": state.get("policy_issues", []),
         "coverage": state.get("coverage"),
-        "retrieved_clauses": [{"id": c["id"], "title": c["title"], "score": c["score"]}
-                              for c in state.get("retrieved_clauses", [])],
+        "retrieved_clauses": state.get("retrieved_clauses", []),
         "assessment": state.get("assessment"),
         "fraud": state.get("fraud"),
         "reasons": state.get("reasons", []),

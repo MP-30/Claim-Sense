@@ -56,6 +56,13 @@ class FIRReport(BaseModel):
 
 # 2. Coverage decision (RAG over policy wording)
 
+class SurveyCauseFinding(BaseModel):
+    finding: str = Field(description="What the surveyor observed about the cause of the assessed repairs")
+    wear_or_breakdown: bool = Field(
+        description="True only if wear, depreciation or mechanical/electrical failure caused assessed damage"
+    )
+
+
 class CoverageDecision(BaseModel):
     covered: bool = Field(description="True if the loss is covered by the policy wording")
     exclusion_clause_ids: list[str] = Field(description="Clause IDs (from the provided clauses only) that exclude the claim; empty if covered")

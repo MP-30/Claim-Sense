@@ -50,9 +50,9 @@ Startup creates tables. Loading reference rows is a separate operation. Rerunnin
 
 ## Verification and remaining course work
 
-The checked-in workflow code and the local `CLM-1014` test cover the synchronous path. The test uses a disposable PostgreSQL database and a mocked model. The course also calls for real-document extraction across 20 samples, a restart during review, a manager dashboard, an evaluation scorecard and an AWS demo with teardown. The [roadmap](roadmap.md) gives the acceptance check for each.
+The portal shows survey deductions with their policy clauses, coverage wording, fraud signals, and a manager dashboard. Claim snapshots retain the retrieved wording as it appeared at decision time. The restart test submits a pending claim, replaces the API process, then approves the saved thread through Streamlit. The 20-claim scorecard records a missed vehicle-use exclusion on CLM-1015. The remaining course milestone is the AWS demo with teardown. [Portal tests](tests/test_portal_restart.py) · [Scorecard](evals/scorecards/2026-11-23.md) · [Roadmap](roadmap.md)
 
-The evaluator measures processing through the first pause or finalization. Claim snapshots sum model usage accumulated on that path. Building the reusable policy index has a separate embedding cost, and the supplied price table assigns zero to an unlisted model. Record the model, pricing assumptions and timing boundary with the scorecard. [Evaluator](evals/run_evals.py) · [Cost calculation](src/claim_sense/integrations/llm.py)
+The evaluator records initial routing and assessment before review. With `--resume`, it also times the simulated review and letter generation. Each final claim records total model cost and active processing time across both phases. The evaluator requires configured prices for the selected models, applies cached-input pricing to the reported cached tokens, and builds the shared policy index before starting the claim timer. [Evaluator](evals/run_evals.py) · [Cost calculation](src/claim_sense/integrations/llm.py)
 
 ## Proposed worker and recovery
 

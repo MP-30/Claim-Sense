@@ -15,12 +15,18 @@ def client() -> OpenAI:
     return OpenAI()  # reads OPENAI_API_KEY from the environment / .env
 
 
-def _usage(step: str, model: str, input_tokens: int, output_tokens: int) -> dict:
+def _usage(step: str, model: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> dict:
     """Token counts -> cost in rupees, tagged with the graph step that spent it."""
-    price_in, price_out = config.PRICES_USD_PER_1M.get(model, (0.0, 0.0))
-    cost_usd = (input_tokens * price_in + output_tokens * price_out) / 1_000_000
+    price_in, price_cached, price_out = config.PRICES_USD_PER_1M.get(model, (0.0, 0.0, 0.0))
+    cost_usd = ((input_tokens - cached_tokens) * price_in + cached_tokens * price_cached
+                + output_tokens * price_out) / 1_000_000
     return {"step": step, "model": model, "input_tokens": input_tokens, "output_tokens": output_tokens,
-            "cost_inr": round(cost_usd * config.USD_TO_INR, 4)}
+            "cached_input_tokens": cached_tokens, "cost_inr": round(cost_usd * config.USD_TO_INR, 8)}
+
+
+def response_usage(step: str, usage) -> dict:
+    cached = getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", 0) or 0
+    return _usage(step, config.OPENAI_MODEL, usage.input_tokens, usage.output_tokens, cached)
 
 
 def pdf_part(path: Path) -> dict:
@@ -45,7 +51,7 @@ def parse(step: str, instructions: str, content: list[dict], schema: type[BaseMo
         text_format=schema,
         temperature=0,
     )
-    usage = _usage(step, config.OPENAI_MODEL, response.usage.input_tokens, response.usage.output_tokens)
+    usage = response_usage(step, response.usage)
     return response.output_parsed, usage
 
 
@@ -57,7 +63,7 @@ def write(step: str, instructions: str, text: str) -> tuple[str, dict]:
         input=text,
         temperature=0.3,
     )
-    usage = _usage(step, config.OPENAI_MODEL, response.usage.input_tokens, response.usage.output_tokens)
+    usage = response_usage(step, response.usage)
     return response.output_text.strip(), usage
 
 

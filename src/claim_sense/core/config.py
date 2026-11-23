@@ -11,10 +11,12 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
 
+# Standard USD per million tokens: input, cached input, output.
 PRICES_USD_PER_1M = {
-    "gpt-4.1-mini": (0.40, 1.60),
-    "gpt-5-mini": (0.25, 2.00),
-    "text-embedding-3-small": (0.02, 0.0),
+    "gpt-4.1-mini": (0.40, 0.10, 1.60),
+    "gpt-5-mini": (0.25, 0.025, 2.00),
+    "gpt-5.4-nano": (0.20, 0.02, 1.25),
+    "text-embedding-3-small": (0.02, 0.02, 0.0),
 }
 USD_TO_INR = float(os.getenv("USD_TO_INR", "88"))
 
