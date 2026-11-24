@@ -1,27 +1,30 @@
 # Claim-Sense infrastructure
 
-Docker Compose runs the claims application. LocalStack Pro hosts the first stage of its AWS infrastructure on the same machine. As of 24 November 2026, a claim submitted through the local portal uses Compose PostgreSQL and the mounted data directory. The ECS cluster in LocalStack is empty.
+LocalStack Pro runs Claim-Sense in the `claimsense-local` ECS service. Docker Compose provides a separate development environment. Each environment has its own PostgreSQL database and data directory.
 
-## 1. Where a local claim goes
+## 1. Where a LocalStack ECS claim goes
 
 ```mermaid
 flowchart LR
     User["Adjuster browser"]
-    subgraph Compose["Docker Compose"]
+    subgraph Task["LocalStack ECS · claimsense-local task"]
         UI["Streamlit portal"]
         API["FastAPI and LangGraph"]
         DB[("PostgreSQL 18")]
-        UI -->|"HTTP to api:8000"| API
-        API -->|"SQL to db:5432"| DB
+        UI -->|"HTTP on the task's Docker network"| API
+        API -->|"PostgreSQL on the Docker network"| DB
     end
-    User -->|"127.0.0.1:8501"| UI
-    User -->|"127.0.0.1:8000/docs"| API
-    DB -->|"Claims, audit log and checkpoints"| Volume[("postgres-data volume")]
-    API -->|"Save uploaded PDFs and read evidence"| Files[("Host data/ mounted at /app/data")]
+    User -->|"127.0.0.1:18501"| UI
+    User -->|"127.0.0.1:18000/docs"| API
+    DB -->|"Claims, audit log and checkpoints"| Volume[("Persisted LocalStack ECS database")]
+    API -->|"Save uploaded PDFs and read evidence"| Files[("Persisted LocalStack ECS data directory")]
     API -->|"PDF extraction, embeddings and model calls"| Model["OpenAI API"]
 ```
 
-When a review pauses, PostgreSQL stores both the claim's thread ID and its LangGraph checkpoint. Uploaded PDFs live under `data/uploads/<claim_id>/`. Replacing the API container preserves both the pending review and its files as long as the database volume and host directory remain available. [Compose configuration](docker-compose.yml) · [Claim processing and review flow](Design.md)
+When a review pauses, PostgreSQL stores the claim's thread ID and its LangGraph checkpoint. The local task stores PostgreSQL files and uploads under `~/.cache/claimsense-ecs/` so the data is available to replacement tasks. The API stores PDFs in its mounted data directory. The S3 bucket is ready for the planned storage integration. [Claim processing and review flow](Design.md)
+
+- Streamlit portal [http://127.0.0.1:18501/](http://127.0.0.1:18501/)
+- FastAPI docs [http://127.0.0.1:18000/docs](http://127.0.0.1:18000/docs)
 
 ## 2. What Terraform provisions in LocalStack
 
@@ -32,12 +35,22 @@ flowchart LR
         Gateway["LocalStack gateway"]
         Gateway --> ECR["ECR repository · claimsense"]
         Gateway --> ECS["ECS cluster · claimsense-cluster"]
+        ECS --> Service["ECS service · claimsense-local"]
+        ECR -->|"Task image"| Service
+        SSM["SSM SecureString<br/>/claimsense/openai_api_key"] -->|"ECS execution role reads at task startup"| Service
+        Service -->|"Inject OPENAI_API_KEY into the API container"| TaskAPI["API container"]
         Gateway --> Logs["CloudWatch Logs · /ecs/claimsense<br/>7-day retention"]
         Gateway --> S3[("S3 bucket · claimsense-pdfs-*<br/>Public access blocked, versioning enabled,<br/>AES-256 default encryption")]
     end
 ```
 
-Terraform manages seven resources here. S3 accounts for four of them because Terraform manages the bucket, public access block, versioning and encryption individually. To inspect the emulator, run `make local-check` from the Terraform repository. To find the generated bucket name and ECR URL, run `terraform -chdir=environments/localstack output` there. [Terraform repository](https://github.com/MP-30/Claim-Sense-Terraform)
+Terraform provisions the foundation first. Publishing the image and applying the local configuration again adds the service, task definition and execution permissions. Run `make local-check` in the Terraform repository to check the running service and its HTTP endpoints. [Terraform repository](https://github.com/MP-30/Claim-Sense-Terraform)
+
+### OpenAI configuration and claim retries
+
+Store the OpenAI key in LocalStack Parameter Store as a `SecureString`. The local Terraform variables file, `environments/localstack/local-model.auto.tfvars.json`, contains the parameter name and model setting. ECS reads the key during task startup and sets `OPENAI_API_KEY` for FastAPI. The verified local deployment uses `gpt-5.4-nano`. [LocalStack setup](https://github.com/MP-30/Claim-Sense-Terraform)
+
+The portal and API health endpoint can respond before OpenAI credentials are configured. If a submission records `OpenAIError: Missing credentials`, check the parameter, apply the ECS configuration so the replacement task receives the key, and resubmit the claim. On 24 November 2026, rerunning synthetic claim `CLM-1007` through the portal's API endpoint changed its status from `FAILED` to `APPROVED` with a payout of ₹12,100.
 
 ## 3. How the AWS demo is designed to run
 
