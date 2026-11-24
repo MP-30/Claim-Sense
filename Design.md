@@ -1,6 +1,6 @@
 # ClaimSense system design
 
-ClaimSense processes synthetic motor insurance claims for the fictional insurer NorthStar. For each submission, it checks coverage, calculates the amount supported by the survey and determines who may make the final decision. A small, covered claim can settle automatically. Every recommended rejection needs a person’s decision. [Course problem by Shivank Agrawal](../../Documents/scaler_notes/ai-bootcamp/day6/insurance-project3/problem.html)
+ClaimSense processes synthetic motor insurance claims for the fictional insurer NorthStar. For each submission, it checks coverage, calculates the amount supported by the survey and determines who may make the final decision. A small, covered claim can settle automatically. Every recommended rejection needs a person’s decision. 
 
 ## Follow one claim through the current system
 
