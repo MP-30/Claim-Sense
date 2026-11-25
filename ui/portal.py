@@ -127,6 +127,29 @@ def upload_claim() -> None:
         st.error("Upload both a claim form and a surveyor report.")
         return
     uploads = {"claim_form": claim_form, "survey_report": survey_report, "fir": fir}
+    if os.getenv("CLAIMS_DOCUMENTS_BUCKET"):
+        with st.spinner("Uploading PDFs to S3…"):
+            plan = api_request("POST", "/claims/uploads", json={
+                field: upload.size for field, upload in uploads.items() if upload is not None
+            })
+            if plan is None:
+                return
+            try:
+                for field, target in plan["uploads"].items():
+                    response = requests.put(
+                        target["url"], headers=target["headers"], data=uploads[field].getvalue(),
+                        timeout=(5, 120), allow_redirects=False,
+                    )
+                    if response.status_code != 200:
+                        st.error(f"S3 did not accept the {field.replace('_', ' ')} PDF. Please try again.")
+                        return
+            except requests.RequestException:
+                st.error("Could not upload the PDFs to S3. Please try again.")
+                return
+        submit(f"/claims/uploads/{plan['claim_id']}/complete", "Processing claim documents…",
+               json={"has_fir": fir is not None})
+        return
+
     files = {
         field: (upload.name, upload.getvalue(), "application/pdf")
         for field, upload in uploads.items()

@@ -6,11 +6,14 @@ ClaimSense processes synthetic motor insurance claims for the fictional insurer 
 
 ```mermaid
 flowchart LR
-    Portal["Streamlit portal"] -->|Submit PDFs or a sample, review a claim| API["FastAPI"]
+    Portal["Streamlit portal"] -->|Request upload URLs, confirm uploads, run samples or submit reviews| API["FastAPI"]
     Swagger["Swagger UI"] -->|Same endpoints| API
-    API -->|Save uploaded PDFs| Files[("Mounted data directory")]
+    Portal -->|PUT PDFs with presigned URLs on ECS| S3[("Private S3 bucket")]
+    API -->|Verify uploaded objects| S3
+    API -->|Save uploads in default Compose setup| Files[("Mounted data directory")]
     API -->|Start or resume within the request| Graph["LangGraph"]
-    Files -->|Sample or uploaded PDFs and policy wording| Graph
+    S3 -->|New ECS uploads| Graph
+    Files -->|Samples, local uploads and policy wording| Graph
     Graph -->|Extract facts, embed clauses, judge coverage and consistency, draft letter| Model["OpenAI"]
     DB[("PostgreSQL 18")] -->|Policy, garage and prior claims| Graph
     Graph -->|Save claim, audit events and thread checkpoints| DB
@@ -58,7 +61,7 @@ flowchart TD
 
 **Trace it in the portal.** For sample `CLM-1008`, the recorded run had a fraud score of 0 and an assessed payout of ₹90,000. Follow **No** at the fraud threshold, then **Yes** at the adjuster check because ₹90,000 exceeds ₹50,000. The portal shows `PENDING_ADJUSTER` until a reviewer submits a decision. The restart test approves this claim on its saved thread and checks the ₹90,000 letter. [Recorded run](evals/scorecards/2026-11-23.csv) · [Portal test](tests/test_portal_restart.py)
 
-1. **Submit.** Streamlit posts the claim form, survey report and optional police FIR to `POST /claims`. The API saves the PDFs under `data/uploads/<claim_id>/`, creates a `PROCESSING` claim and assigns a fresh LangGraph `thread_id`. The sample endpoint uses an existing directory and its sample ID. [API routes](src/claim_sense/api/claims.py) · [Claim service](src/claim_sense/services/service.py)
+1. **Submit.** On LocalStack ECS, Streamlit requests presigned PUT URLs from `POST /claims/uploads`, sends the claim form, survey report and optional FIR directly to S3, then calls `POST /claims/uploads/{claim_id}/complete`. The API verifies the uploads, saves their S3 location with the `PROCESSING` claim and assigns a LangGraph thread. Docker Compose uses the multipart endpoint and writes to `data/uploads/<claim_id>/` by default. The sample endpoint reads the sample directory. [API routes](src/claim_sense/api/claims.py) · [Claim service](src/claim_sense/services/service.py)
 2. **Read and assess.** Each PDF gets a separate model call and typed output. Python checks policy existence, vehicle registration, cover dates, own-damage cover and licence validity. A hard failure skips coverage retrieval and payout assessment and goes directly to the fraud check. Otherwise the graph retrieves policy clauses, asks the model about exclusions, then calculates the amount from the survey items. [Intake](src/claim_sense/services/intake.py) · [Graph edges](src/claim_sense/workflows/graph.py)
 3. **Route.** The model compares the accounts in the form, survey and FIR. Python combines contradictions with signals such as prior claims and garage watchlist status, records their points and chooses the route. The API returns HTTP 200 with the saved claim once it finishes or pauses. Initial graph exceptions are also recorded as a claim with `status=FAILED` and an `error` field. Inspect the returned status when debugging an upload. [Rules](src/claim_sense/domain/rules.py) · [Claim service](src/claim_sense/services/service.py)
 4. **Review and finalize.** For a pending claim, the portal posts the review to `/claims/{claim_id}/review`. The service checks pending status, the approval amount against the available insured declared value (IDV), and notes for overrides. It resumes the saved thread. Python sets the final amount, using zero for rejection, and the model drafts the letter. The portal displays the saved letter and audit trail. Sending the letter to a customer would require a delivery integration. Reviewer names currently come from the submitted form. [Portal](ui/portal.py) · [Review schema](src/claim_sense/schemas/schemas.py)

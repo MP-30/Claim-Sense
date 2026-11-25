@@ -10,18 +10,22 @@ flowchart LR
     subgraph Task["LocalStack ECS · claimsense-local task"]
         UI["Streamlit portal"]
         API["FastAPI and LangGraph"]
-        UI -->|"HTTP on the task's Docker network"| API
+        UI -->|"Request upload URLs, then confirm the upload"| API
     end
     API -->|"Connect to the RDS endpoint"| DB[("LocalStack RDS for PostgreSQL 18")]
     User -->|"127.0.0.1:18501"| UI
     User -->|"127.0.0.1:18000/docs"| API
     UI -->|"Exchange username and password for an access token"| Cognito["LocalStack Cognito user pool"]
     API -->|"Fetch public keys to verify access tokens"| Cognito
-    API -->|"Save uploaded PDFs and read evidence"| Files[("Persisted LocalStack ECS data directory")]
+    UI -->|"PUT PDFs with five-minute presigned URLs"| S3[("Private, versioned S3 bucket")]
+    API -->|"Verify uploaded objects and read PDFs for extraction"| S3
+    API -->|"Read policy files, sample PDFs and earlier uploads"| Files[("Mounted ECS data directory")]
     API -->|"PDF extraction, embeddings and model calls"| Model["OpenAI API"]
 ```
 
-RDS stores the claim records, audit log, and LangGraph checkpoints. The API stores uploaded PDFs under `~/.cache/claimsense-ecs/data` on the host so replacement tasks can read them. The S3 bucket is ready for the planned storage integration. [Claim processing and review flow](Design.md)
+RDS stores claim records, audit events and LangGraph checkpoints. For a new portal submission, FastAPI issues a presigned PUT URL for each PDF. The Streamlit server sends the bytes directly to the private bucket at `uploads/<claim_id>/<document>.pdf` and then calls FastAPI to confirm the upload. The API verifies the objects, records their S3 location and reads them during extraction. Samples and PDFs uploaded before the switch still use the host mount under `~/.cache/claimsense-ecs/data`. [Claim processing and review flow](Design.md)
+
+**Verified on LocalStack Pro on 26 November 2026.** All three PDFs for synthetic claim `CLM-UB8B99BB472F64ED0ACDC60FE9F9CCE96` matched the source files in private S3. A repeated PUT was rejected. FastAPI read the PDFs from S3, saved the claim as `PENDING_ADJUSTER`, and returned the same workflow thread on a repeated completion request.
 
 - Streamlit portal [http://127.0.0.1:18501/](http://127.0.0.1:18501/)
 - FastAPI docs [http://127.0.0.1:18000/docs](http://127.0.0.1:18000/docs)
@@ -47,6 +51,7 @@ flowchart LR
         TaskAPI -->|"PostgreSQL connection"| RDS
         Gateway --> Logs["CloudWatch Logs · /ecs/claimsense<br/>7-day retention"]
         Gateway --> S3[("S3 bucket · claimsense-pdfs-*<br/>Public access blocked, versioning enabled,<br/>AES-256 default encryption")]
+        TaskAPI -->|"ECS task role authorizes access to uploads/"| S3
     end
 ```
 
@@ -79,7 +84,8 @@ flowchart TB
         DB[("Planned private Amazon RDS for PostgreSQL 18<br/>Claims, audit log and checkpoints")]
         API -.->|"Connect using a database secret"| DB
     end
-    API -.->|"Read and write PDFs with an ECS task role"| S3[("Private, versioned S3 bucket")]
+    API -.->|"Presign uploads and read PDFs with an ECS task role"| S3[("Private, versioned S3 bucket")]
+    UI -.->|"PUT PDFs using presigned URLs"| S3
     API -->|"Model calls over HTTPS"| Model["OpenAI API"]
     UI -->|"Container logs"| Logs["CloudWatch Logs"]
     API -->|"Container logs"| Logs
@@ -90,5 +96,5 @@ The root Terraform configuration defines one Fargate task with two containers sh
 **Remaining work for the demo**
 
 1. Provision a private Amazon RDS for PostgreSQL 18 instance. Allow database traffic from the ECS security group and supply the API’s database credentials through Secrets Manager.
-2. Update intake to store uploaded PDFs in S3 and retain their object keys with the claim. Provision the synthetic demo inputs separately. The image build excludes uploads and sample claim directories. [Docker build exclusions](.dockerignore)
+2. Configure the AWS ECS task role and set `CLAIMS_DOCUMENTS_BUCKET` for the API and portal. Provision the synthetic demo inputs separately. The image build excludes uploads and sample claim directories. [Docker build exclusions](.dockerignore)
 3. Publish the tagged image, supply the OpenAI parameter, then start the service. Submit a synthetic claim that needs review, replace the task, and approve the same claim. Verify its decision, audit history and PDFs survive replacement before demonstrating teardown. [M6 acceptance criteria](roadmap.md#m6--demonstrate-deployment-and-teardown)

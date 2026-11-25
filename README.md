@@ -44,6 +44,8 @@ docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHO
 
 FastAPI initializes the claim and checkpoint tables on startup. PostgreSQL data persists in the `postgres-data` volume. The API mounts the repository's `data/` directory for policy wording, uploads, and sample documents.
 
+The LocalStack ECS deployment uses a private S3 bucket for new claim uploads. Streamlit uploads each PDF using a presigned URL, and the API reads the objects when it processes the claim. [Infrastructure and upload flow](infra.md)
+
 ## Seed the demo dataset
 
 From the project root, start PostgreSQL and run the generator on the host with `uv` and Python 3.14. It uses the database settings in `.env`. The default settings connect to the published Compose database port.
