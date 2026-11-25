@@ -1,17 +1,62 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from typing import Annotated
 
+from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import APIRouter, Depends, File, HTTPException, Path, UploadFile
+from pydantic import BaseModel, Field
+
+from claim_sense.api.auth import require_user
 from claim_sense.core import config
 from claim_sense.db import repository as db
+from claim_sense.integrations import documents
 from claim_sense.schemas.schemas import ReviewDecision
-from claim_sense.services.service import process_claim, review_claim, sample_claim_dir, save_upload
+from claim_sense.services.service import new_upload_id, process_claim, review_claim, sample_claim_dir, save_upload
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_user)])
+
+PDFSize = Annotated[int, Field(gt=0, le=documents.MAX_PDF_BYTES)]
 
 
-@router.get("/health")
-def health():
-    return {"status": "ok", "model": config.OPENAI_MODEL}
+class UploadSizes(BaseModel):
+    claim_form: PDFSize
+    survey_report: PDFSize
+    fir: PDFSize | None = None
+
+
+class UploadCompletion(BaseModel):
+    has_fir: bool = False
+
+
+@router.post("/claims/uploads")
+def prepare_upload(sizes: UploadSizes, username: Annotated[str | None, Depends(require_user)]):
+    """Issue one presigned PUT per PDF for a new claim."""
+    if not config.DOCUMENTS_BUCKET:
+        raise HTTPException(503, "S3 uploads are not configured.")
+    claim_id = new_upload_id()
+    metadata = documents.upload_metadata(username, sizes.fir is not None)
+    try:
+        targets = {
+            field: documents.presign_upload(claim_id, field, size, metadata)
+            for field, size in sizes.model_dump(exclude_none=True).items()
+        }
+    except (BotoCoreError, ClientError) as error:
+        raise HTTPException(503, "Claim document storage is temporarily unavailable.") from error
+    return {"claim_id": claim_id, "uploads": targets, "expires_in": documents.UPLOAD_EXPIRY_SECONDS}
+
+
+@router.post("/claims/uploads/{claim_id}/complete")
+def complete_upload(claim_id: Annotated[str, Path(pattern=r"^CLM-U[A-F0-9]{32}$")],
+                    completion: UploadCompletion, username: Annotated[str | None, Depends(require_user)]):
+    """Confirm that every expected PDF was uploaded before processing the claim."""
+    if not config.DOCUMENTS_BUCKET:
+        raise HTTPException(503, "S3 uploads are not configured.")
+    try:
+        verified = documents.verify_upload(claim_id, username, completion.has_fir)
+    except (BotoCoreError, ClientError) as error:
+        raise HTTPException(503, "Claim document storage is temporarily unavailable.") from error
+    if not verified:
+        raise HTTPException(409, "The expected claim PDFs are missing or do not match this upload.")
+    return process_claim(claim_id, documents.upload_location(claim_id), new_upload=True)
 
 
 @router.post("/claims")
@@ -27,9 +72,12 @@ def submit_claim(claim_form: UploadFile = File(..., description="Claim form PDF"
         if not (upload.filename or "").lower().endswith(".pdf"):
             raise HTTPException(400, f"{name} must be a PDF")
         contents[name] = upload.file.read()
-    claim_id, folder = save_upload(contents)
+    try:
+        claim_id, folder = save_upload(contents)
+    except (BotoCoreError, ClientError) as error:
+        raise HTTPException(503, "Claim document storage is temporarily unavailable.") from error
     # Runs synchronously (~10-20 s). In production: put the claim on a queue (SQS) and return 202 immediately.
-    return process_claim(claim_id, folder)
+    return process_claim(claim_id, folder, new_upload=True)
 
 
 @router.post("/claims/sample/{claim_id}")
@@ -62,9 +110,11 @@ def get_claim(claim_id: str):
 
 
 @router.post("/claims/{claim_id}/review")
-def submit_review(claim_id: str, review: ReviewDecision):
+def submit_review(claim_id: str, review: ReviewDecision, username: Annotated[str | None, Depends(require_user)]):
     """Adjuster / SIU decision. Resumes the paused LangGraph run and writes the customer letter."""
     try:
+        if username is not None:
+            review = review.model_copy(update={"reviewer": username})
         return review_claim(claim_id, review)
     except ValueError as error:
         raise HTTPException(400, str(error))

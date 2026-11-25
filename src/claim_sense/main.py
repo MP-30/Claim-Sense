@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from claim_sense.api.claims import router as claims_router
+from claim_sense.core import config
 from claim_sense.db.session import engine, init_db
 from claim_sense.workflows.graph import init_checkpoints
 
@@ -19,6 +20,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ClaimSense", lifespan=lifespan)
 app.include_router(claims_router)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": config.OPENAI_MODEL}
 
 
 @app.get("/")

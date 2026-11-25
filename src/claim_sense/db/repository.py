@@ -68,6 +68,13 @@ def get_claim(claim_id: str) -> dict | None:
     return claim
 
 
+def create_claim(claim_id: str, **fields) -> bool:
+    statement = insert(Claim).values(claim_id=claim_id, **fields)
+    statement = statement.on_conflict_do_nothing(index_elements=[Claim.claim_id]).returning(Claim.claim_id)
+    with SessionLocal.begin() as session:
+        return session.execute(statement).scalar_one_or_none() is not None
+
+
 def list_claims(status: str | None = None) -> list[dict]:
     statement = select(
         Claim.claim_id, Claim.policy_number, Claim.status, Claim.route, Claim.recommendation,

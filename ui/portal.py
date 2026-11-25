@@ -1,10 +1,12 @@
 """Local Streamlit portal for the ClaimSense API."""
 
 import os
+import time
 from urllib.parse import quote
 
 import requests
 import streamlit as st
+from claim_sense.api.auth import auth_required
 
 
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -15,14 +17,77 @@ REVIEW_QUEUES = {
 QUEUES = {"All claims": None, **{label: status for status, label in REVIEW_QUEUES.items()}}
 
 
+def require_sign_in() -> None:
+    session = st.session_state.get("cognito_session")
+    if session and time.monotonic() < session["expires"]:
+        st.sidebar.write(f"Signed in as {session['username']}")
+        if st.sidebar.button("Sign out"):
+            st.session_state.clear()
+            st.rerun()
+        return
+    if session:
+        st.session_state.clear()
+        st.info("Your session expired. Sign in again.")
+
+    client_id = os.getenv("COGNITO_CLIENT_ID")
+    issuer = os.getenv("COGNITO_ISSUER")
+    endpoint = os.getenv("COGNITO_ENDPOINT") or (issuer.rsplit("/", 1)[0] if issuer else None)
+    if not client_id or not endpoint:
+        st.error("Cognito sign-in is unavailable.")
+        st.stop()
+
+    with st.form("cognito_sign_in", clear_on_submit=True):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+    if not submitted:
+        st.stop()
+    if not username.strip() or not password:
+        st.error("Enter your username and password.")
+        st.stop()
+
+    try:
+        response = requests.post(
+            endpoint,
+            headers={"X-Amz-Target": "AWSCognitoIdentityProviderService.InitiateAuth",
+                     "Content-Type": "application/x-amz-json-1.1"},
+            json={"AuthFlow": "USER_PASSWORD_AUTH", "ClientId": client_id,
+                  "AuthParameters": {"USERNAME": username.strip(), "PASSWORD": password}},
+            timeout=10,
+        )
+        response.raise_for_status()
+        result = response.json().get("AuthenticationResult")
+        if result:
+            st.session_state["cognito_session"] = {
+                "access_token": result["AccessToken"],
+                "username": username.strip(),
+                "expires": time.monotonic() + result["ExpiresIn"],
+            }
+            st.rerun()
+        st.error("Ask an administrator to finish setting up your account.")
+    except requests.HTTPError as error:
+        if error.response.status_code == 400:
+            st.error("Sign-in failed. Check your username and password.")
+        else:
+            st.error("Cognito sign-in is temporarily unavailable.")
+    except (requests.RequestException, KeyError, ValueError):
+        st.error("Cognito sign-in is temporarily unavailable.")
+    st.stop()
+
+
 def api_request(method: str, path: str, **kwargs):
     # Claim processing and letter drafting run within the POST request.
     timeout = (3, 5 if method == "GET" else 300)
+    session = st.session_state.get("cognito_session")
+    headers = {"Authorization": f"Bearer {session['access_token']}"} if session else {}
     try:
-        response = requests.request(method, f"{API_URL}{path}", timeout=timeout, **kwargs)
+        response = requests.request(method, f"{API_URL}{path}", timeout=timeout, headers=headers, **kwargs)
         response.raise_for_status()
         return response.json()
     except requests.HTTPError as error:
+        if session and error.response.status_code == 401:
+            st.session_state.clear()
+            st.rerun()
         detail = None
         try:
             detail = error.response.json().get("detail")
@@ -97,7 +162,8 @@ def review_claim(claim: dict) -> None:
         key=f"decision_{claim_id}",
     )
     with st.form(f"review_{claim_id}"):
-        reviewer = st.text_input("Reviewer name")
+        session = st.session_state.get("cognito_session")
+        reviewer = session["username"] if session else st.text_input("Reviewer name")
         amount = 0.0
         if decision == "APPROVE":
             amount = st.number_input(
@@ -271,6 +337,8 @@ def show_queue(manager: bool = False) -> None:
 def main() -> None:
     st.set_page_config(page_title="ClaimSense", layout="wide")
     st.title("ClaimSense")
+    if auth_required():
+        require_sign_in()
     result = st.session_state.pop("claim_result", None)
     if result is not None:
         claim_id, status = result

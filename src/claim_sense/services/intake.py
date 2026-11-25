@@ -1,5 +1,4 @@
-from pathlib import Path
-from claim_sense.integrations import llm
+from claim_sense.integrations import documents, llm
 from claim_sense.schemas.schemas import ClaimForm, FIRReport, SurveyReport
 
 
@@ -35,22 +34,24 @@ def extract_documents(docs_dir: str) -> tuple[dict, list[dict]]:
     Returns ({"claim_form": {...}, "survey": {...}, "fir": {...} or None}, [usage, ...]).
     The claim form and survey report are mandatory; the FIR is optional.
     """
-    folder = Path(docs_dir)
+    names = documents.document_names(docs_dir)
     for required in ("claim_form.pdf", "survey_report.pdf"):
-        if not (folder / required).exists():
-            raise FileNotFoundError(f"{required} is missing in {folder}")
+        if required not in names:
+            raise FileNotFoundError(f"{required} is missing in {docs_dir}")
 
     extracted, usages = {}, []
     for file_name, (schema, extra) in DOCUMENTS.items():
-        path = folder / file_name
         key = {"claim_form.pdf": "claim_form", "survey_report.pdf": "survey", "fir.pdf": "fir"}[file_name]
-        if not path.exists():          # only the FIR can be missing at this point
+        if file_name not in names:     # only the FIR can be missing at this point
             extracted[key] = None
             continue
         parsed, usage = llm.parse(
             step=f"intake:{key}",
             instructions=COMMON_RULES + "\n" + extra,
-            content=[llm.pdf_part(path), llm.text_part("Extract the fields from this document.")],
+            content=[
+                llm.pdf_bytes_part(file_name, documents.read_pdf(docs_dir, file_name)),
+                llm.text_part("Extract the fields from this document."),
+            ],
             schema=schema,
         )
         extracted[key] = parsed.model_dump()

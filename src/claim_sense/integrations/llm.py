@@ -31,8 +31,12 @@ def response_usage(step: str, usage) -> dict:
 
 def pdf_part(path: Path) -> dict:
     """Attach a PDF directly to the request. The model reads text AND layout (tables), so no OCR library needed."""
-    data = base64.b64encode(path.read_bytes()).decode()
-    return {"type": "input_file", "filename": path.name, "file_data": f"data:application/pdf;base64,{data}"}
+    return pdf_bytes_part(path.name, path.read_bytes())
+
+
+def pdf_bytes_part(filename: str, content: bytes) -> dict:
+    data = base64.b64encode(content).decode()
+    return {"type": "input_file", "filename": filename, "file_data": f"data:application/pdf;base64,{data}"}
 
 
 def text_part(text: str) -> dict:

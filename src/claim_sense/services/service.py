@@ -5,6 +5,7 @@ from langgraph.types import Command
 
 from claim_sense.core import config
 from claim_sense.db import repository as db
+from claim_sense.integrations import documents
 from claim_sense.schemas.schemas import ReviewDecision
 from claim_sense.workflows.graph import get_app
 
@@ -44,11 +45,16 @@ def describe(node: str, update: dict) -> str:
     return ""
 
 
-def process_claim(claim_id: str, docs_dir: str | Path, verbose: bool = False) -> dict:
+def process_claim(claim_id: str, docs_dir: str | Path, verbose: bool = False, *, new_upload: bool = False) -> dict:
     """Run a claim through the graph until it finishes (auto-approve) or pauses (human review)."""
-    db.reset_claim(claim_id)                              # re-processing starts a clean run
     thread_id = f"{claim_id}-{uuid.uuid4().hex[:8]}"     # one LangGraph thread per run
-    db.save_claim(claim_id, docs_dir=str(docs_dir), thread_id=thread_id, status="PROCESSING")
+    fields = {"docs_dir": str(docs_dir), "thread_id": thread_id, "status": "PROCESSING"}
+    if new_upload:
+        if not db.create_claim(claim_id, **fields):
+            return db.get_claim(claim_id)
+    else:
+        db.reset_claim(claim_id)  # Reprocessing an existing sample starts a clean run.
+        db.save_claim(claim_id, **fields)
     db.add_audit(claim_id, "received", "agent", {"docs_dir": str(docs_dir)})
 
     graph_config = {"configurable": {"thread_id": thread_id}}
@@ -91,9 +97,17 @@ def review_claim(claim_id: str, review: ReviewDecision, verbose: bool = False) -
     return db.get_claim(claim_id)
 
 
-def save_upload(files: dict[str, bytes]) -> tuple[str, Path]:
-    """Store uploaded PDFs as data/uploads/<claim_id>/<claim_form|survey_report|fir>.pdf."""
-    claim_id = f"CLM-U{uuid.uuid4().hex[:6].upper()}"
+def new_upload_id() -> str:
+    return f"CLM-U{uuid.uuid4().hex.upper()}"
+
+
+def save_upload(files: dict[str, bytes]) -> tuple[str, str | Path]:
+    claim_id = new_upload_id()
+    if config.DOCUMENTS_BUCKET:
+        for name, content in files.items():
+            documents.store_pdf(claim_id, name, content)
+        return claim_id, documents.upload_location(claim_id)
+
     folder = config.UPLOADS_DIR / claim_id
     folder.mkdir(parents=True, exist_ok=True)
     for name, content in files.items():
