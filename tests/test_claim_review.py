@@ -238,6 +238,68 @@ class ClaimReviewTest(unittest.TestCase):
             for field, (_, content, _) in pdfs.items():
                 self.assertEqual((config.UPLOADS_DIR / claim_id / f"{field}.pdf").read_bytes(), content)
 
+    def test_queued_upload_recovers_saved_interrupt_on_repeat_delivery(self):
+        from sqlalchemy.exc import OperationalError
+
+        from claim_sense.core import config
+        from claim_sense.db import repository
+        from claim_sense.integrations import documents, llm
+        from claim_sense.services import service
+
+        claim_id = service.new_upload_id()
+        path = f"/claims/uploads/{claim_id}/complete"
+        sample_dir = config.SAMPLE_CLAIMS_DIR / "CLM-1014"
+        with (
+            patch.object(config, "DOCUMENTS_BUCKET", "test-documents"),
+            patch.object(config, "PROCESSING_QUEUE_URL", "https://example.com/processing"),
+            patch.object(documents, "verify_upload", return_value=True),
+            patch.object(documents, "upload_location", return_value=str(sample_dir)),
+            patch.object(service.boto3, "client") as aws_client,
+            patch.object(llm, "client", return_value=model_stub(self.scenarios["CLM-1014"])),
+        ):
+            first = self.api.post(path, json={"has_fir": True})
+            self.assertEqual(first.status_code, 202, first.text)
+            self.assertEqual(first.headers["Location"], f"/claims/{claim_id}")
+            queued = first.json()
+            self.assertEqual(queued["status"], "QUEUED")
+            self.assertEqual(self.api.post(path, json={"has_fir": True}).json()["thread_id"], queued["thread_id"])
+            self.assertEqual(aws_client.return_value.send_message.call_count, 2)
+
+            with repository.lock_claim_processing(claim_id):
+                with self.assertRaisesRegex(RuntimeError, "already has an active worker"):
+                    service.process_queued_claim(claim_id)
+
+            original_save = repository.save_claim
+
+            def lose_database_before_publishing(claim_id, **fields):
+                if fields.get("status") == "PENDING_ADJUSTER":
+                    raise OperationalError(None, None, ConnectionError("database disconnected"))
+                return original_save(claim_id, **fields)
+
+            with patch.object(repository, "save_claim", side_effect=lose_database_before_publishing):
+                with self.assertRaises(OperationalError):
+                    service.process_queued_claim(claim_id)
+            self.assertEqual(repository.get_claim(claim_id)["status"], "PROCESSING")
+
+            service.process_queued_claim(claim_id)
+            service.process_queued_claim(claim_id)
+            service.process_queued_claim(claim_id, dead_letter=True)
+
+            saved = self.api.get(f"/claims/{claim_id}").json()
+            self.assertEqual(saved["status"], "PENDING_ADJUSTER", saved.get("error"))
+            self.assertEqual(saved["thread_id"], queued["thread_id"])
+            steps = [event["step"] for event in saved["audit_trail"]]
+            self.assertEqual(steps.count("received"), 1)
+            self.assertEqual(steps.count("route_claim"), 1)
+            self.assertEqual(self.api.post(path, json={"has_fir": True}).status_code, 200)
+            self.assertEqual(aws_client.return_value.send_message.call_count, 2)
+
+            review = self.api.post(f"/claims/{claim_id}/review", json={
+                "decision": "REJECT", "approved_amount": 0, "reviewer": "Demo Adjuster",
+            })
+            self.assertEqual(review.status_code, 200, review.text)
+            self.assertEqual(review.json()["status"], "REJECTED")
+
 
 def model_stub(scenario):
     from claim_sense.schemas.schemas import ConsistencyReport, CoverageDecision, SurveyCauseFinding

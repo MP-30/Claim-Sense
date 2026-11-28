@@ -15,6 +15,7 @@ REVIEW_QUEUES = {
     "PENDING_SIU": "SIU investigation",
 }
 QUEUES = {"All claims": None, **{label: status for status, label in REVIEW_QUEUES.items()}}
+IN_PROGRESS = {"QUEUED", "PROCESSING"}
 
 
 def require_sign_in() -> None:
@@ -110,11 +111,20 @@ def submit(path: str, progress: str, **kwargs) -> None:
     with st.spinner(progress):
         claim = api_request("POST", path, **kwargs)
     if claim is not None:
+        if path.endswith("/complete"):
+            st.session_state.pop("pending_upload", None)
         st.session_state["claim_result"] = (claim["claim_id"], claim["status"])
         st.rerun()
 
 
 def upload_claim() -> None:
+    pending = st.session_state.get("pending_upload")
+    if pending:
+        claim_id, has_fir = pending
+        st.info(f"PDFs for {claim_id} are already in S3. Retry confirmation to finish submitting the claim.")
+        if st.button("Retry confirmation"):
+            submit(f"/claims/uploads/{claim_id}/complete", "Confirming upload…", json={"has_fir": has_fir})
+
     with st.form("upload_claim"):
         claim_form = st.file_uploader("Claim form", type="pdf")
         survey_report = st.file_uploader("Surveyor report", type="pdf")
@@ -146,7 +156,8 @@ def upload_claim() -> None:
             except requests.RequestException:
                 st.error("Could not upload the PDFs to S3. Please try again.")
                 return
-        submit(f"/claims/uploads/{plan['claim_id']}/complete", "Processing claim documents…",
+        st.session_state["pending_upload"] = (plan["claim_id"], fir is not None)
+        submit(f"/claims/uploads/{plan['claim_id']}/complete", "Confirming upload…",
                json={"has_fir": fir is not None})
         return
 
@@ -279,13 +290,17 @@ def show_review_evidence(details: dict) -> None:
             st.json(details["extracted"], expanded=False)
 
 
-def show_claim(claim_id: str, *, allow_review: bool = True) -> None:
+def show_claim(claim_id: str, *, allow_review: bool = True, polling: bool = False) -> None:
     claim = api_request("GET", f"/claims/{quote(claim_id, safe='')}")
     if claim is None:
         return
+    if polling and claim["status"] not in IN_PROGRESS:
+        st.rerun()
 
     st.subheader(claim_id)
     st.write(f"Status: **{REVIEW_QUEUES.get(claim['status'], claim['status'].title())}**")
+    if polling:
+        st.caption("This view refreshes automatically while the claim is processing.")
     if claim.get("policy_number"):
         st.text(f"Policy {claim['policy_number']}")
     recommendation, assessed, final, fraud = st.columns(4)
@@ -312,6 +327,11 @@ def show_claim(claim_id: str, *, allow_review: bool = True) -> None:
         st.text(claim["letter"])
     with st.expander("Audit trail"):
         st.json(claim["audit_trail"], expanded=False)
+
+
+@st.fragment(run_every=3)
+def poll_claim(claim_id: str, *, allow_review: bool) -> None:
+    show_claim(claim_id, allow_review=allow_review, polling=True)
 
 
 def show_queue(manager: bool = False) -> None:
@@ -354,7 +374,11 @@ def show_queue(manager: bool = False) -> None:
         st.session_state.pop("selected_claim", None)
     claim_id = st.selectbox("Open a claim", claim_ids, index=None, key="selected_claim")
     if claim_id is not None:
-        show_claim(claim_id, allow_review=not manager)
+        claim_status = next(claim["status"] for claim in claims if claim["claim_id"] == claim_id)
+        if claim_status in IN_PROGRESS:
+            poll_claim(claim_id, allow_review=not manager)
+        else:
+            show_claim(claim_id, allow_review=not manager)
 
 
 def main() -> None:

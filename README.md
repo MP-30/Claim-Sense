@@ -44,7 +44,7 @@ docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHO
 
 FastAPI initializes the claim and checkpoint tables on startup. PostgreSQL data persists in the `postgres-data` volume. The API mounts the repository's `data/` directory for policy wording, uploads, and sample documents.
 
-The LocalStack ECS deployment uses a private S3 bucket for new claim uploads. Streamlit uploads each PDF using a presigned URL, and the API reads the objects when it processes the claim. [Infrastructure and upload flow](infra.md)
+On LocalStack Pro, Streamlit uploads each PDF to private S3 using a presigned URL. With the Lambda worker deployed, FastAPI confirms the upload, queues its claim ID in SQS and returns HTTP 202. The portal polls while Lambda reads the PDFs and processes the claim. [Infrastructure and upload flow](infra.md)
 
 ## Seed the demo dataset
 
@@ -61,7 +61,7 @@ For model-backed processing, also copy `claimsense/data/policy_wording.md` from 
 
 ## Submit and review a claim
 
-1. Open **Submit claim**. Upload the claim form, surveyor report, and optional police FIR as PDFs, or choose **Run a sample**. The API processes the claim during the request.
+1. Open **Submit claim**. Upload the claim form, surveyor report, and optional police FIR as PDFs, or choose **Run a sample**. A new upload on LocalStack with the worker deployed opens its claim record and refreshes while the status is **Queued** or **Processing**. Sample runs and uploads in the default Docker Compose setup run during the API request.
 2. Open **Claims** and choose **Adjuster review** or **SIU investigation**. Each claim shows the coverage decision, retrieved policy clauses, survey line items and their depreciation rules, deductible, fraud signals and audit trail.
 3. Open a pending claim, enter the reviewer name, and submit an approval or rejection. Add notes when overriding the AI recommendation. The portal displays the final payout and decision letter after the API saves the decision.
 4. Open **Manager dashboard** for both queue sizes and the share of all claims approved automatically. Select a claim to inspect its decision and audit history.

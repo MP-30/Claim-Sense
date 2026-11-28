@@ -11,8 +11,11 @@ flowchart LR
     Portal -->|PUT PDFs with presigned URLs on ECS| S3[("Private S3 bucket")]
     API -->|Verify uploaded objects| S3
     API -->|Save uploads in default Compose setup| Files[("Mounted data directory")]
-    API -->|Start or resume within the request| Graph["LangGraph"]
-    S3 -->|New ECS uploads| Graph
+    API -->|Send claim ID and return HTTP 202| Queue["SQS"]
+    Queue -->|Invoke for each queued claim| Worker["Lambda"]
+    Worker -->|Start or recover an upload| Graph["LangGraph"]
+    API -->|Run a sample or resume a review| Graph
+    S3 -->|New claim PDFs| Graph
     Files -->|Samples, local uploads and policy wording| Graph
     Graph -->|Extract facts, embed clauses, judge coverage and consistency, draft letter| Model["OpenAI"]
     DB[("PostgreSQL 18")] -->|Policy, garage and prior claims| Graph
@@ -24,7 +27,8 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Upload["Upload claim form and survey report<br/>Police FIR is optional"] -->|Save PDFs under a new claim ID| Start["Create PROCESSING claim<br/>Assign a fresh thread ID"]
+    Upload["Upload claim form and survey report<br/>Police FIR is optional"] -->|Save PDFs and verify S3 objects| Queued["Create QUEUED claim and send ID to SQS"]
+    Queued -->|Lambda takes over| Start["Set PROCESSING status<br/>Use the assigned thread ID"]
     Sample["Run a named sample"] -->|Reuse sample PDFs and replace its previous run| Start
     Start --> Intake["Intake · Extract typed facts from each PDF"]
     Intake --> Policy{"Policy found, vehicle matches, policy active,<br/>own damage covered and licence valid on loss date?"}
@@ -61,9 +65,9 @@ flowchart TD
 
 **Trace it in the portal.** For sample `CLM-1008`, the recorded run had a fraud score of 0 and an assessed payout of ₹90,000. Follow **No** at the fraud threshold, then **Yes** at the adjuster check because ₹90,000 exceeds ₹50,000. The portal shows `PENDING_ADJUSTER` until a reviewer submits a decision. The restart test approves this claim on its saved thread and checks the ₹90,000 letter. [Recorded run](evals/scorecards/2026-11-23.csv) · [Portal test](tests/test_portal_restart.py)
 
-1. **Submit.** On LocalStack ECS, Streamlit requests presigned PUT URLs from `POST /claims/uploads`, sends the claim form, survey report and optional FIR directly to S3, then calls `POST /claims/uploads/{claim_id}/complete`. The API verifies the uploads, saves their S3 location with the `PROCESSING` claim and assigns a LangGraph thread. Docker Compose uses the multipart endpoint and writes to `data/uploads/<claim_id>/` by default. The sample endpoint reads the sample directory. [API routes](src/claim_sense/api/claims.py) · [Claim service](src/claim_sense/services/service.py)
+1. **Submit.** On LocalStack ECS, Streamlit requests presigned PUT URLs, sends the PDFs to S3, then calls `POST /claims/uploads/{claim_id}/complete`. The API verifies the uploads, stores their S3 location on a `QUEUED` claim, assigns a LangGraph thread and sends the claim ID to SQS. HTTP 202 includes a `Location` header for the claim. Docker Compose uses synchronous multipart uploads and the local uploads directory by default. [API routes](src/claim_sense/api/claims.py) · [Claim service](src/claim_sense/services/service.py)
 2. **Read and assess.** Each PDF gets a separate model call and typed output. Python checks policy existence, vehicle registration, cover dates, own-damage cover and licence validity. A hard failure skips coverage retrieval and payout assessment and goes directly to the fraud check. Otherwise the graph retrieves policy clauses, asks the model about exclusions, then calculates the amount from the survey items. [Intake](src/claim_sense/services/intake.py) · [Graph edges](src/claim_sense/workflows/graph.py)
-3. **Route.** The model compares the accounts in the form, survey and FIR. Python combines contradictions with signals such as prior claims and garage watchlist status, records their points and chooses the route. The API returns HTTP 200 with the saved claim once it finishes or pauses. Initial graph exceptions are also recorded as a claim with `status=FAILED` and an `error` field. Inspect the returned status when debugging an upload. [Rules](src/claim_sense/domain/rules.py) · [Claim service](src/claim_sense/services/service.py)
+3. **Route.** The model compares the accounts in the form, survey and FIR. Python combines contradictions with prior claims and garage watchlist status, records their points and chooses the route. The portal reads the current status from the claim endpoint. Workflow failures appear as `FAILED` with an error. [Rules](src/claim_sense/domain/rules.py) · [Claim service](src/claim_sense/services/service.py)
 4. **Review and finalize.** For a pending claim, the portal posts the review to `/claims/{claim_id}/review`. The service checks pending status, the approval amount against the available insured declared value (IDV), and notes for overrides. It resumes the saved thread. Python sets the final amount, using zero for rejection, and the model drafts the letter. The portal displays the saved letter and audit trail. Sending the letter to a customer would require a delivery integration. Reviewer names currently come from the submitted form. [Portal](ui/portal.py) · [Review schema](src/claim_sense/schemas/schemas.py)
 
 For example, uploading the PDFs from `CLM-1014` creates a new `CLM-U…` ID. The integration test supplies a police finding of intoxication, retrieves `EXC-4`, and checks that the recommendation is `REJECT` while the status is still `PENDING_ADJUSTER`. After the adjuster rejects, the same claim reads `REJECTED` with a ₹0 final amount. Use the ID from the upload response for both the review and the final GET. [Executable example](tests/test_claim_review.py)
@@ -90,7 +94,7 @@ For example, uploading the PDFs from `CLM-1014` creates a new `CLM-U…` ID. The
 | PostgreSQL application tables | `policies`, `garages` and `prior_claims` supply reference facts. `claims` holds the current status, thread ID, assessment, recommendation, final amount and letter. `audit_log` records the actor, time, step and result. Claim detail and queue endpoints read these tables. |
 | PostgreSQL LangGraph tables | Checkpoints hold the execution state for a thread. A review uses its stored ID and `Command(resume=...)`. The Compose volume keeps both application records and checkpoints across API restarts. |
 
-Startup creates tables. Loading reference rows is a separate operation. Rerunning a named sample clears its previous claim row and audit entries and allocates a new thread. For repeatable comparisons, use a dedicated demo database. Application writes, audit events and checkpoints currently commit separately. A persisted review pause supports later resumption, while recovery from a crash between writes still needs the worker changes below. [Persistence](src/claim_sense/db/repository.py) · [Application startup](src/claim_sense/main.py) · [Compose](docker-compose.yml)
+Startup creates tables. Loading reference rows is a separate operation. Rerunning a named sample clears its previous claim row and audit entries and allocates a new thread. For repeatable comparisons, use a dedicated demo database. Review status is published after the graph saves its interrupt checkpoint. Final decisions, letters and their final audit event commit together. [Persistence](src/claim_sense/db/repository.py) · [Application startup](src/claim_sense/main.py) · [Compose](docker-compose.yml)
 
 ## Verification and remaining course work
 
@@ -98,15 +102,15 @@ The portal shows survey deductions with their policy clauses, coverage wording, 
 
 The evaluator records initial routing and assessment before review. With `--resume`, it also times the simulated review and letter generation. Each final claim records total model cost and active processing time across both phases. The evaluator requires configured prices for the selected models, applies cached-input pricing to the reported cached tokens, and builds the shared policy index before starting the claim timer. [Evaluator](evals/run_evals.py) · [Cost calculation](src/claim_sense/integrations/llm.py)
 
-## Proposed worker and recovery
+## Lambda worker and recovery
 
-Implement this extension once the synchronous baseline is reproducible. A queue shortens the upload request and gives another process a way to recover interrupted work. Keep the existing graph and public claim ID.
+The worker uses the same graph and PostgreSQL tables as the API. SQS receives a single claim ID per message. Streamlit refreshes the selected claim every three seconds while it is queued or processing.
 
-| Boundary | Proposed behavior |
+| Boundary | Behavior |
 | --- | --- |
-| Accept upload | Stage immutable PDFs by document type. In one PostgreSQL transaction, store the claim, run with a unique thread ID, and PROCESS job. Return HTTP 202 with the claim ID and status for polling. A scoped submission key plus content digest identifies identical retries. Return the original claim on a match and HTTP 409 for different content. Clean up unreferenced staged files. |
-| Execute or recover | A worker sharing the PDFs leases a job, records an attempt, renews the lease and runs the graph. After expiry a replacement resumes the same checkpoint. Fence business writes and checkpoint writes by checking current lease ownership in their respective write transactions. Bound retries and record a terminal failure reason. |
-| Publish review | Expose a pending queue status after the interrupt checkpoint is durable. If a worker stops between those writes, a replacement can publish the saved pause. Authorize the reviewer for the queue and commit one accepted review and its RESUME job together. Identical review replays return the saved result and conflicting decisions fail. |
-| Finalize | Commit one final decision per run, its letter, the final audit event and job completion together. A retry may repeat a model call. Enforce uniqueness on the committed outcome and preserve attempts and earlier runs. |
+| Accept upload | Save the claim and received audit record together in PostgreSQL, then send its ID to SQS before acknowledging submission. If dispatch fails, the portal can retry confirmation using the same uploaded PDFs and claim ID. |
+| Execute or recover | Lambda holds a PostgreSQL advisory lock while running the claim. A redelivery resumes the saved LangGraph thread if processing is still active and skips claims that already finished or reached review. A crash during a graph step can repeat that step. |
+| End processing | Save an automatic decision or save the interrupt before exposing a human review queue status. FastAPI handles the review request and resumes the checkpoint when a person decides. |
+| Deliver repeatedly failing jobs | SQS redrives the message to a dead-letter queue after three unsuccessful deliveries. Its Lambda mapping marks an unfinished claim `FAILED` when the worker can connect to the database. |
 
-Introduce these records with versioned migrations. Move uploads and sample submissions onto the worker, update the portal to poll `GET /claims/{claim_id}`, and keep the CLI and evaluator able to wait for a resolved route. For page-level evidence, start by storing a document ID, page and verified quote for one survey amount. The planned AWS deployment uses ECS, persistent PostgreSQL and private PDF storage. The sibling repository owns the infrastructure. [Terraform](../Claim-Sense-Terraform/main.tf)
+A transactional outbox can recover automatically if the API stops after saving the claim but before sending its SQS message. The current flow recovers that window when the client retries confirmation. [Worker handler](src/claim_sense/lambda_worker.py) · [Terraform](../Claim-Sense-Terraform/environments/localstack/worker.tf)

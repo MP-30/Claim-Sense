@@ -18,14 +18,23 @@ flowchart LR
     UI -->|"Exchange username and password for an access token"| Cognito["LocalStack Cognito user pool"]
     API -->|"Fetch public keys to verify access tokens"| Cognito
     UI -->|"PUT PDFs with five-minute presigned URLs"| S3[("Private, versioned S3 bucket")]
-    API -->|"Verify uploaded objects and read PDFs for extraction"| S3
+    API -->|"Verify uploaded objects"| S3
+    API -->|"Send claim ID, then return HTTP 202"| Queue["SQS processing queue"]
+    Queue -->|"Invoke for one claim"| Worker["Lambda worker"]
+    Queue -->|"Redrive after repeated delivery failures"| DLQ["Dead-letter queue"]
+    DLQ -->|"Mark an unfinished claim FAILED"| Worker
+    Worker -->|"Read PDFs"| S3
+    Worker -->|"Save claim status, audit and checkpoints"| DB
+    Worker -->|"Extract, assess and draft letters"| Model
     API -->|"Read policy files, sample PDFs and earlier uploads"| Files[("Mounted ECS data directory")]
     API -->|"PDF extraction, embeddings and model calls"| Model["OpenAI API"]
 ```
 
-RDS stores claim records, audit events and LangGraph checkpoints. For a new portal submission, FastAPI issues a presigned PUT URL for each PDF. The Streamlit server sends the bytes directly to the private bucket at `uploads/<claim_id>/<document>.pdf` and then calls FastAPI to confirm the upload. The API verifies the objects, records their S3 location and reads them during extraction. Samples and PDFs uploaded before the switch still use the host mount under `~/.cache/claimsense-ecs/data`. [Claim processing and review flow](Design.md)
+RDS stores claim records, audit events and LangGraph checkpoints. Streamlit uploads the PDFs using presigned PUT URLs and calls FastAPI to confirm them. With the worker deployed, the API verifies the objects at `uploads/<claim_id>/<document>.pdf`, records a `QUEUED` claim and sends only its ID through SQS. Lambda reads the PDFs, runs the original workflow and records the result in RDS. Human reviews and sample runs use FastAPI. Sample and older PDFs remain on the host mount under `~/.cache/claimsense-ecs/data`. [Claim processing and review flow](Design.md)
 
 **Verified on LocalStack Pro on 26 November 2026.** All three PDFs for synthetic claim `CLM-UB8B99BB472F64ED0ACDC60FE9F9CCE96` matched the source files in private S3. A repeated PUT was rejected. FastAPI read the PDFs from S3, saved the claim as `PENDING_ADJUSTER`, and returned the same workflow thread on a repeated completion request.
+
+**Lambda verified on LocalStack Pro on 28 November 2026.** Synthetic claim `CLM-U315744012C0D41689760365DB107AFD0` received HTTP 202 in 0.14 seconds after upload confirmation, then advanced through `QUEUED`, `PROCESSING` and `PENDING_ADJUSTER`. The ECS review API resumed the same thread and approved ₹90,000.
 
 - Streamlit portal [http://127.0.0.1:18501/](http://127.0.0.1:18501/)
 - FastAPI docs [http://127.0.0.1:18000/docs](http://127.0.0.1:18000/docs)
@@ -52,10 +61,17 @@ flowchart LR
         Gateway --> Logs["CloudWatch Logs · /ecs/claimsense<br/>7-day retention"]
         Gateway --> S3[("S3 bucket · claimsense-pdfs-*<br/>Public access blocked, versioning enabled,<br/>AES-256 default encryption")]
         TaskAPI -->|"ECS task role authorizes access to uploads/"| S3
+        Gateway --> Queue["SQS processing queue and dead-letter queue"]
+        Queue --> Worker["Container-image Lambda worker"]
+        ECR -->|"Lambda image"| Worker
+        Worker -->|"Read PDFs"| S3
+        Worker -->|"Read password"| DBSecret
+        Worker -->|"Read OpenAI key"| SSM
+        Worker -->|"Persist workflow state"| RDS
     end
 ```
 
-Terraform provisions the foundation first. Publishing the image and applying the local configuration again adds RDS, the ECS task definition and service, and execution permissions. Run `make local-check` in the Terraform repository to check the HTTP endpoints and confirm the database engine version from inside ECS. [Terraform repository](https://github.com/MP-30/Claim-Sense-Terraform)
+Terraform provisions the foundation first. Publish the API and worker images before applying the local configuration to update ECS and deploy Lambda with its SQS mappings. Run `make local-check` in the Terraform repository to verify Lambda, the HTTP endpoints and the PostgreSQL version. [Terraform repository](https://github.com/MP-30/Claim-Sense-Terraform)
 
 **Verified on 25 November 2026.** The ECS API connected to LocalStack RDS running PostgreSQL 18.7. The migration preserved the three existing claims and their audit and checkpoint records. A new synthetic claim, `CLM-U14C6F4`, kept its LangGraph thread and original PDFs across task replacement and was then approved for ₹90,000.
 
@@ -96,5 +112,5 @@ The root Terraform configuration defines one Fargate task with two containers sh
 **Remaining work for the demo**
 
 1. Provision a private Amazon RDS for PostgreSQL 18 instance. Allow database traffic from the ECS security group and supply the API’s database credentials through Secrets Manager.
-2. Configure the AWS ECS task role and set `CLAIMS_DOCUMENTS_BUCKET` for the API and portal. Provision the synthetic demo inputs separately. The image build excludes uploads and sample claim directories. [Docker build exclusions](.dockerignore)
+2. Configure the AWS ECS task role and set `CLAIMS_DOCUMENTS_BUCKET` for the API and portal. Deploy SQS and Lambda with private RDS connectivity and outbound access to OpenAI. Provision the synthetic demo inputs separately. [Docker build exclusions](.dockerignore)
 3. Publish the tagged image, supply the OpenAI parameter, then start the service. Submit a synthetic claim that needs review, replace the task, and approve the same claim. Verify its decision, audit history and PDFs survive replacement before demonstrating teardown. [M6 acceptance criteria](roadmap.md#m6--demonstrate-deployment-and-teardown)
