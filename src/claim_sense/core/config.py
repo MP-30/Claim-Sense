@@ -27,8 +27,9 @@ DATA_DIR = Path(os.getenv("CLAIMS_DATA_DIR", str(ROOT_DIR / "data")))
 SAMPLE_CLAIMS_DIR = DATA_DIR / "sample_claims"
 UPLOADS_DIR = DATA_DIR / "uploads"
 DOCUMENTS_BUCKET = os.getenv("CLAIMS_DOCUMENTS_BUCKET")
+PROCESSING_QUEUE_URL = os.getenv("CLAIMS_PROCESSING_QUEUE_URL")
 POLICY_WORDING_PATH = DATA_DIR / "policy_wording.md"
-POLICY_INDEX_PATH = DATA_DIR / "policy_index.json"
+POLICY_INDEX_PATH = Path(os.getenv("CLAIMS_POLICY_INDEX_PATH", str(DATA_DIR / "policy_index.json")))
 EVAL_LABELS_PATH = DATA_DIR / "eval_labels.csv"
 
 

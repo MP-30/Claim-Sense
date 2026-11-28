@@ -1,7 +1,7 @@
 from typing import Annotated
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import APIRouter, Depends, File, HTTPException, Path, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Response, UploadFile
 from pydantic import BaseModel, Field
 
 from claim_sense.api.auth import require_user
@@ -9,7 +9,9 @@ from claim_sense.core import config
 from claim_sense.db import repository as db
 from claim_sense.integrations import documents
 from claim_sense.schemas.schemas import ReviewDecision
-from claim_sense.services.service import new_upload_id, process_claim, review_claim, sample_claim_dir, save_upload
+from claim_sense.services.service import (
+    enqueue_upload, new_upload_id, process_claim, review_claim, sample_claim_dir, save_upload,
+)
 
 
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -44,9 +46,23 @@ def prepare_upload(sizes: UploadSizes, username: Annotated[str | None, Depends(r
     return {"claim_id": claim_id, "uploads": targets, "expires_in": documents.UPLOAD_EXPIRY_SECONDS}
 
 
-@router.post("/claims/uploads/{claim_id}/complete")
+def accept_upload(claim_id: str, location: str, response: Response) -> dict:
+    if not config.PROCESSING_QUEUE_URL:
+        return process_claim(claim_id, location, new_upload=True)
+    try:
+        claim = enqueue_upload(claim_id, location)
+    except (BotoCoreError, ClientError) as error:
+        raise HTTPException(503, f"Could not queue claim {claim_id}. Retry upload confirmation.") from error
+    if claim["status"] in {"QUEUED", "PROCESSING"}:
+        response.status_code = 202
+        response.headers["Location"] = f"/claims/{claim_id}"
+    return claim
+
+
+@router.post("/claims/uploads/{claim_id}/complete", responses={202: {"description": "Claim queued for processing"}})
 def complete_upload(claim_id: Annotated[str, Path(pattern=r"^CLM-U[A-F0-9]{32}$")],
-                    completion: UploadCompletion, username: Annotated[str | None, Depends(require_user)]):
+                    completion: UploadCompletion, username: Annotated[str | None, Depends(require_user)],
+                    response: Response):
     """Confirm that every expected PDF was uploaded before processing the claim."""
     if not config.DOCUMENTS_BUCKET:
         raise HTTPException(503, "S3 uploads are not configured.")
@@ -56,11 +72,11 @@ def complete_upload(claim_id: Annotated[str, Path(pattern=r"^CLM-U[A-F0-9]{32}$"
         raise HTTPException(503, "Claim document storage is temporarily unavailable.") from error
     if not verified:
         raise HTTPException(409, "The expected claim PDFs are missing or do not match this upload.")
-    return process_claim(claim_id, documents.upload_location(claim_id), new_upload=True)
+    return accept_upload(claim_id, documents.upload_location(claim_id), response)
 
 
-@router.post("/claims")
-def submit_claim(claim_form: UploadFile = File(..., description="Claim form PDF"),
+@router.post("/claims", responses={202: {"description": "Claim queued for processing"}})
+def submit_claim(response: Response, claim_form: UploadFile = File(..., description="Claim form PDF"),
                  survey_report: UploadFile = File(..., description="Surveyor report PDF"),
                  fir: UploadFile | None = File(None, description="Police FIR PDF (optional)")):
     """Upload a new claim's PDFs and process it. Returns the claim with its status and AI decision."""
@@ -76,8 +92,7 @@ def submit_claim(claim_form: UploadFile = File(..., description="Claim form PDF"
         claim_id, folder = save_upload(contents)
     except (BotoCoreError, ClientError) as error:
         raise HTTPException(503, "Claim document storage is temporarily unavailable.") from error
-    # Runs synchronously (~10-20 s). In production: put the claim on a queue (SQS) and return 202 immediately.
-    return process_claim(claim_id, folder, new_upload=True)
+    return accept_upload(claim_id, str(folder), response)
 
 
 @router.post("/claims/sample/{claim_id}")

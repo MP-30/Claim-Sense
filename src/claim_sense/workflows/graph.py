@@ -112,13 +112,10 @@ def route_claim(state: ClaimState) -> dict:
     decision = rules.decide_route(state.get("policy_issues", []), state.get("coverage"),
                                   state.get("assessment"), state["fraud"])
     new_state = {**state, **decision}
-    status = {"AUTO_APPROVE": "PROCESSING", "ADJUSTER_REVIEW": "PENDING_ADJUSTER",
-              "SIU_INVESTIGATION": "PENDING_SIU"}[decision["route"]]
-    db.save_claim(state["claim_id"], status=status, route=decision["route"],
+    db.save_claim(state["claim_id"], route=decision["route"],
                   recommendation=decision["recommendation"], fraud_score=state["fraud"]["score"],
                   payable_amount=(state.get("assessment") or {}).get("payable"),
-                  details_json=snapshot(new_state))
-    db.add_audit(state["claim_id"], "route_claim", "agent", decision)
+                  details_json=snapshot(new_state), audit=("route_claim", "agent", decision))
     return decision
 
 
@@ -153,8 +150,8 @@ def finalize(state: ClaimState) -> dict:
     final = {"final_decision": decision, "final_amount": amount, "letter": letter}
     db.save_claim(state["claim_id"], status="APPROVED" if decision == "APPROVE" else "REJECTED",
                   final_decision=decision, final_amount=amount, reviewer=actor, letter=letter,
-                  details_json=snapshot({**state, **final, "llm_usage": state.get("llm_usage", []) + [usage]}))
-    db.add_audit(state["claim_id"], "finalize", actor, {"decision": decision, "amount": amount})
+                  details_json=snapshot({**state, **final, "llm_usage": state.get("llm_usage", []) + [usage]}),
+                  audit=("finalize", actor, {"decision": decision, "amount": amount}))
     return {**final, "llm_usage": [usage]}
 
 

@@ -11,6 +11,8 @@ from claim_sense.workflows.graph import init_checkpoints
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        if config.PROCESSING_QUEUE_URL and not config.DOCUMENTS_BUCKET:
+            raise RuntimeError("Background processing requires S3 document storage.")
         init_db()
         init_checkpoints()
         yield

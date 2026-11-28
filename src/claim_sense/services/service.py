@@ -1,7 +1,11 @@
 import uuid
 from pathlib import Path
 
+import boto3
+from botocore.config import Config
 from langgraph.types import Command
+from psycopg import OperationalError as CheckpointConnectionError
+from sqlalchemy.exc import OperationalError as DatabaseConnectionError
 
 from claim_sense.core import config
 from claim_sense.db import repository as db
@@ -54,23 +58,59 @@ def process_claim(claim_id: str, docs_dir: str | Path, verbose: bool = False, *,
             return db.get_claim(claim_id)
     else:
         db.reset_claim(claim_id)  # Reprocessing an existing sample starts a clean run.
-        db.save_claim(claim_id, **fields)
-    db.add_audit(claim_id, "received", "agent", {"docs_dir": str(docs_dir)})
+        db.save_claim(claim_id, **fields, audit=("received", "agent", {"docs_dir": str(docs_dir)}))
+    return run_initial_graph(claim_id, str(docs_dir), thread_id, verbose)
 
+
+def run_initial_graph(claim_id: str, docs_dir: str, thread_id: str, verbose: bool = False, *,
+                      recover: bool = False) -> dict:
     graph_config = {"configurable": {"thread_id": thread_id}}
     try:
         with get_app() as graph:
-            state = {"claim_id": claim_id, "docs_dir": str(docs_dir), "llm_usage": []}
-            for step in graph.stream(state, graph_config, stream_mode="updates", durability="sync"):
-                if verbose:
-                    for node, update in step.items():
-                        print(f"  [{node:<14}] {describe(node, update)}")
-    except Exception as error:   # any failure -> claim goes to FAILED with the reason, never silently lost
-        db.save_claim(claim_id, status="FAILED", error=f"{type(error).__name__}: {error}")
-        db.add_audit(claim_id, "error", "agent", {"error": str(error)})
+            state = {"claim_id": claim_id, "docs_dir": docs_dir, "llm_usage": []}
+            checkpoint = graph.get_state(graph_config) if recover else None
+            if not checkpoint or not checkpoint.interrupts:
+                graph_input = None if checkpoint and checkpoint.values else state
+                for step in graph.stream(graph_input, graph_config, stream_mode="updates", durability="sync"):
+                    if verbose:
+                        for node, update in step.items():
+                            print(f"  [{node:<14}] {describe(node, update)}")
+                checkpoint = graph.get_state(graph_config)
+            if checkpoint.interrupts:
+                status = "PENDING_SIU" if checkpoint.values["route"] == "SIU_INVESTIGATION" else "PENDING_ADJUSTER"
+                db.save_claim(claim_id, status=status)
+    except Exception as error:
+        if recover and isinstance(error, (CheckpointConnectionError, DatabaseConnectionError)):
+            raise
+        db.mark_processing_failed(claim_id, f"{type(error).__name__}: {error}")
         if verbose:
             print(f"  [error         ] {type(error).__name__}: {error}")
     return db.get_claim(claim_id)
+
+
+def enqueue_upload(claim_id: str, docs_dir: str) -> dict:
+    thread_id = f"{claim_id}-{uuid.uuid4().hex[:8]}"
+    db.create_claim(claim_id, docs_dir=docs_dir, thread_id=thread_id, status="QUEUED")
+    claim = db.get_claim(claim_id)
+    if claim["status"] == "QUEUED":
+        # If sending fails, repeating upload completion can dispatch the same claim.
+        sqs = boto3.client("sqs", config=Config(connect_timeout=3, read_timeout=5, retries={"total_max_attempts": 2}))
+        sqs.send_message(QueueUrl=config.PROCESSING_QUEUE_URL, MessageBody=claim_id)
+    return claim
+
+
+def process_queued_claim(claim_id: str, *, dead_letter: bool = False) -> None:
+    with db.lock_claim_processing(claim_id) as acquired:
+        if not acquired:
+            raise RuntimeError(f"Claim {claim_id} already has an active worker")
+        claim = db.get_claim(claim_id)
+        if claim is None or claim["status"] not in {"QUEUED", "PROCESSING"}:
+            return
+        if dead_letter:
+            db.mark_processing_failed(claim_id, "Background processing stopped after repeated Lambda delivery failures.")
+            return
+        db.save_claim(claim_id, status="PROCESSING")
+        run_initial_graph(claim_id, claim["docs_dir"], claim["thread_id"], recover=True)
 
 
 def review_claim(claim_id: str, review: ReviewDecision, verbose: bool = False) -> dict:

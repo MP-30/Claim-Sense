@@ -1,9 +1,10 @@
 """PostgreSQL access for policies, garages, claims, and audit events."""
 
+from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import delete, func, literal, select
+from sqlalchemy import delete, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert
 
 from claim_sense.db.session import SessionLocal
@@ -48,13 +49,16 @@ def get_garage(garage_id: str) -> dict | None:
     return dict(row) if row is not None else None
 
 
-def save_claim(claim_id: str, **fields) -> None:
+def save_claim(claim_id: str, *, audit: tuple[str, str, dict] | None = None, **fields) -> None:
     statement = insert(Claim).values(claim_id=claim_id, **fields)
     updated = {key: statement.excluded[key] for key in fields}
     updated["updated_at"] = func.now()
     statement = statement.on_conflict_do_update(index_elements=[Claim.claim_id], set_=updated)
     with SessionLocal.begin() as session:
         session.execute(statement)
+        if audit is not None:
+            step, actor, details = audit
+            session.add(AuditLog(claim_id=claim_id, step=step, actor=actor, details=details))
 
 
 def get_claim(claim_id: str) -> dict | None:
@@ -72,7 +76,31 @@ def create_claim(claim_id: str, **fields) -> bool:
     statement = insert(Claim).values(claim_id=claim_id, **fields)
     statement = statement.on_conflict_do_nothing(index_elements=[Claim.claim_id]).returning(Claim.claim_id)
     with SessionLocal.begin() as session:
-        return session.execute(statement).scalar_one_or_none() is not None
+        if session.execute(statement).scalar_one_or_none() is None:
+            return False
+        session.add(AuditLog(claim_id=claim_id, step="received", actor="agent",
+                             details={"docs_dir": fields["docs_dir"]}))
+        return True
+
+
+@contextmanager
+def lock_claim_processing(claim_id: str):
+    """Release the claim lock even if the Lambda container is stopped."""
+    with SessionLocal.begin() as session:
+        acquired = session.scalar(select(func.pg_try_advisory_xact_lock(func.hashtextextended(claim_id, 0))))
+        yield acquired
+
+
+def mark_processing_failed(claim_id: str, reason: str) -> None:
+    statement = (
+        update(Claim)
+        .where(Claim.claim_id == claim_id, Claim.status.in_(("QUEUED", "PROCESSING")))
+        .values(status="FAILED", error=reason)
+        .returning(Claim.claim_id)
+    )
+    with SessionLocal.begin() as session:
+        if session.execute(statement).scalar_one_or_none() is not None:
+            session.add(AuditLog(claim_id=claim_id, step="error", actor="agent", details={"error": reason}))
 
 
 def list_claims(status: str | None = None) -> list[dict]:
